@@ -705,6 +705,7 @@ form.addEventListener('submit', async e => {
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  let streaming = false, streamBuf = '';
   try {
     const res = await fetch('/api/ask', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -734,6 +735,14 @@ form.addEventListener('submit', async e => {
                  [payload.article_id, payload.page]);
           } else if (payload.type === 'tile_error') {
             step('!', `<span class="err">brak regionu ${payload.tile_index}:${payload.chunk_index}</span>`);
+          } else if (payload.type === 'answer_delta') {
+            // Render as it arrives. The ---CYTATY--- block is stripped server
+            // side and only exists in the final payload, so mdToHtml runs over
+            // the accumulated raw text and gets replaced wholesale on 'done'.
+            if (!streaming) { streaming = true; streamBuf = ''; bodyEl.classList.remove('meta'); }
+            streamBuf += payload.text;
+            bodyEl.innerHTML = mdToHtml(streamBuf.split('---CYTATY---')[0]);
+            logEl.scrollTop = logEl.scrollHeight;
           }
         } else if (kind === 'done') {
           bodyEl.classList.remove('meta');
@@ -749,9 +758,11 @@ form.addEventListener('submit', async e => {
           else vemptyEl.textContent = 'Ta odpowiedź nie wskazuje strony źródłowej.';
           const u = payload.usage || {};
           const cost = u.cost_usd != null ? ` · ~$${u.cost_usd.toFixed(3)}` : '';
+          const cacheTok = u.cache_read ? ` · ${u.cache_read} cache-read` : '';
+          const hit = payload.cached ? ' · z pamięci podręcznej' : '';
           const m = document.createElement('div');
           m.className = 'meta';
-          m.textContent = `${payload.provider}/${payload.model} · ${u.input||0} in / ${u.output||0} out${cost}`;
+          m.textContent = `${payload.provider}/${payload.model} · ${u.input||0} in / ${u.output||0} out${cacheTok}${cost}${hit}`;
           bot.appendChild(m);
         } else if (kind === 'error') {
           bodyEl.classList.remove('meta');

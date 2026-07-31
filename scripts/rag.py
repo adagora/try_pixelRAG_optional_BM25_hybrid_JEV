@@ -22,7 +22,9 @@ from pathlib import Path
 
 import requests
 
+import answer_cache
 import encoder_device
+import imagefit
 
 # One connection pool for the process. A search makes at least two HTTP calls
 # (encode, then /search) and each used to open, use and discard its own socket:
@@ -79,6 +81,14 @@ HYBRID = os.environ.get("PIXELRAG_HYBRID", "0").strip().lower() in ("1", "true",
 
 # Override either with an env var; see list_models() to see what a key can reach.
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5")
+# Thinking depth for the one-shot read. Empty = the API default (high).
+#
+# Worth setting, because thinking is ON BY DEFAULT on Opus 5 and thinking
+# tokens bill as OUTPUT ($25/M) — a "read this cell and quote it" task was
+# silently paying reasoning rates. `medium` is the starting point, not a
+# conclusion: sweep low/medium/high with evaluate_pl.py before settling, since
+# the whole ONESHOT_SYSTEM prompt exists because misreading a row is expensive.
+ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium").strip().lower()
 # 3.6 Flash: fewer agent turns/tool calls than 3.5 Flash, stronger multimodal
 # (price matrices), cheaper output. Override: GEMINI_MODEL=gemini-3.5-flash-lite
 # for max throughput (set GEMINI_THINKING=medium if tool loops truncate early).
@@ -532,6 +542,23 @@ def _get_encoder() -> dict:
 DEFAULT_INSTRUCTION = "Retrieve images or text relevant to the user's query."
 
 
+@lru_cache(maxsize=256)
+def _embed_cached(text: str, instruction: str | None) -> tuple[float, ...]:
+    """Memoised encode. Tuple so the cache cannot hand out a mutable list.
+
+    The same text gets encoded more than once per question: retrieve.py searches
+    the question and its noun phrase, and the answer cache needs the question's
+    vector before either search runs. At ~140ms a call that adds up, and the
+    encoder is deterministic for a given text.
+    """
+    if _sidecar_available():
+        r = _HTTP.post(f"{ENCODER_URL}/embed",
+                       json={"text": text, "instruction": instruction}, timeout=60)
+        r.raise_for_status()
+        return tuple(r.json()["embedding"])
+    return tuple(_encode_local(text, instruction))
+
+
 def embed_query(text: str, instruction: str | None = None) -> list[float]:
     """Encode as pixelrag_serve._encode_queries does.
 
@@ -542,12 +569,7 @@ def embed_query(text: str, instruction: str | None = None) -> list[float]:
     padding and the CUDA graph together move an index score by up to 7.9e-04 at
     cos 0.999994, which check_parity.py exists to keep honest.
     """
-    if _sidecar_available():
-        r = _HTTP.post(f"{ENCODER_URL}/embed",
-                       json={"text": text, "instruction": instruction}, timeout=60)
-        r.raise_for_status()
-        return r.json()["embedding"]
-    return _encode_local(text, instruction)
+    return list(_embed_cached(text, instruction))
 
 
 def _encode_local(text: str, instruction: str | None = None) -> list[float]:
@@ -733,6 +755,39 @@ def _dispatch(name: str, args: dict) -> tuple[object, dict | None]:
     return f"Unknown tool {name}", None
 
 
+def _cache_namespace(provider: str, model: str, mode: str) -> str:
+    """Everything that changes the answer to the *same* question.
+
+    Only the question is matched fuzzily. Model, page budget, and whether BM25
+    is fused all move the answer, and a rebuilt index moves what the page
+    numbers even refer to — so those are exact-match. A miss costs one reader
+    call; a stale hit quotes last week's price list.
+    """
+    return "|".join([
+        provider, model, mode,
+        f"k{ONESHOT_PAGES}", f"hyb{int(HYBRID)}",
+        answer_cache.index_fingerprint(INDEX_DIR),
+    ])
+
+
+def _replay(cached: dict, emit) -> dict:
+    """Return a cached answer, re-firing its trace so the UI still draws pages.
+
+    Without the replay a cache hit would produce an answer citing pages the
+    user never saw appear, which reads as a bug even though the answer is right.
+    """
+    result = dict(cached["result"])
+    for ev in result.get("trace") or []:
+        emit(ev)
+    result["usage"] = {**result.get("usage", {}),
+                       "input": 0, "output": 0, "thoughts": 0,
+                       "cache_read": 0, "cache_write": 0, "cost_usd": 0.0}
+    result["cached"] = True
+    result["cache_similarity"] = round(cached["similarity"], 4)
+    result["cached_from"] = cached["question"]
+    return result
+
+
 def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
               provider: str | None = None, api_key: str | None = None,
               mode: str | None = None) -> dict:
@@ -761,7 +816,34 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
         runner = {"gemini": _run_gemini, "anthropic": _run_anthropic}.get(provider)
     if runner is None:
         raise RuntimeError(f"Unknown provider {provider!r} (expected gemini or anthropic).")
-    return runner(question, emit, max_steps, trace, api_key=api_key)
+
+    # The question's embedding is needed by retrieval anyway ~140ms from now, so
+    # asking for it here is free (it is memoised) and buys a lookup that can
+    # skip the entire reader call. Agent mode is excluded: its value is the
+    # browse trace, and replaying a canned one would be a lie.
+    key = None
+    if mode == "oneshot":
+        model = GEMINI_MODEL if provider == "gemini" else ANTHROPIC_MODEL
+        ns = _cache_namespace(provider, model, mode)
+        try:
+            key = embed_query(question.strip())
+        except Exception:
+            key = None          # encoder down — answer the slow way, don't fail
+        if key is not None:
+            hit = answer_cache.default().get(key, ns)
+            if hit is not None:
+                return _replay(hit, emit)
+
+    result = runner(question, emit, max_steps, trace, api_key=api_key)
+
+    # Never cache a non-answer: "no pages matched" is usually a transient
+    # search-service problem, and pinning it would keep answering that way.
+    if key is not None and result.get("answer") and result.get("trace"):
+        try:
+            answer_cache.default().put(key, question.strip(), ns, result)
+        except Exception:
+            pass                # a cache write must not fail a good answer
+    return result
 
 
 def _lexical_fn():
@@ -783,7 +865,8 @@ def _lexical_fn():
         return None
 
 
-def _oneshot_pages(question: str, emit, n_pages: int = ONESHOT_PAGES) -> list[dict]:
+def _oneshot_pages(question: str, emit, provider: str,
+                   n_pages: int = ONESHOT_PAGES) -> list[dict]:
     """Hybrid search → best whole pages (retrieve, fuse, read pages).
 
     Page selection is delegated to retrieve.py, which aggregates chunk hits per
@@ -835,6 +918,10 @@ def _oneshot_pages(question: str, emit, n_pages: int = ONESHOT_PAGES) -> list[di
         # page, so boxing it would mark everything and mean nothing.
         box = (box_pct(p["article_id"], p["tile_index"], p["focus"])
                if p["focus"] is not None else None)
+        # Sized for whoever is about to read it. The rendered page is 200 DPI;
+        # every provider bills a smaller number than that, and Gemini's is a
+        # step function with a cliff just below A4 — see imagefit.
+        img, mime = imagefit.fit(path, provider)
         page = {
             "article_id": p["article_id"],
             "document": doc_title(p["article_id"]),
@@ -846,10 +933,13 @@ def _oneshot_pages(question: str, emit, n_pages: int = ONESHOT_PAGES) -> list[di
             "raw_score": round(p["score"], 4),
             "found_by": _prov(p),
             "n_chunks": p["n_chunks"],
+            # Geometry stays in ORIGINAL page pixels: box_pct and the UI's
+            # highlight overlays are percentages of the rendered page, and the
+            # reader's downscale must not leak into them.
             "page_w": pw,
             "page_h": ph,
-            "image": path.read_bytes(),
-            "mime": "image/jpeg",
+            "image": img,
+            "mime": mime,
             "label": f"{doc_title(p['article_id'])} — strona {p['page']}",
         }
         emit({"type": "tile", **{k: page[k] for k in (
@@ -911,14 +1001,26 @@ def resolve_citations(answer: str, cites: list[dict],
     """
     import citations as C
 
-    by_page = {p["page"]: p for p in pages}
+    # Keyed on (article_id, page), NOT page alone: both catalogues have a page
+    # 61, so a bare page number resolved a citation against whichever document
+    # happened to be last in the list — then located the quote in that
+    # document's PDF and drew the highlight there. The reader names only a page
+    # number, so the article is recovered by looking for that page among the
+    # ones actually attached, preferring the highest-ranked.
+    by_key = {(p["article_id"], p["page"]): p for p in pages}
+    first_by_page: dict[int, dict] = {}
+    for p in pages:
+        first_by_page.setdefault(p["page"], p)
+
     out = []
     for c in cites:
         try:
             pno = int(c.get("page"))
         except (TypeError, ValueError):
             continue
-        target = by_page.get(pno)
+        aid = c.get("article_id")
+        target = (by_key.get((aid, pno)) if aid is not None
+                  else first_by_page.get(pno))
         if target is None:
             continue
         pdf = _source_pdf(target["article_id"])
@@ -938,16 +1040,16 @@ def resolve_citations(answer: str, cites: list[dict],
             "verified": bool(found),
         })
 
-    # Numbers are per page, not per citation — attach to the first citation of
-    # each page so the UI draws each box once.
-    for pno in {c["page"] for c in out}:
-        target = by_page.get(pno)
-        pdf = _source_pdf(target["article_id"]) if target else None
+    # Numbers are per (document, page), not per citation — attach to the first
+    # citation of each so the UI draws each box once. Grouping by page alone
+    # would pin one document's figures onto another's page of the same number.
+    for aid, pno in {(c["article_id"], c["page"]) for c in out}:
+        pdf = _source_pdf(aid)
         if not pdf:
             continue
         pinned, repeated = C.locate_numbers(pdf, pno, answer)
         for c in out:
-            if c["page"] == pno:
+            if c["article_id"] == aid and c["page"] == pno:
                 c["numbers"] = pinned
                 c["repeated"] = repeated
                 break
@@ -992,12 +1094,27 @@ def _oneshot_preamble(question: str, pages: list[dict]) -> str:
     )
 
 
+def _stream_answer(emit, text: str) -> None:
+    """Push a fragment of the answer to the caller as it arrives.
+
+    The reader spends seconds on a four-page read, and until it finished the UI
+    had nothing to show but a spinner — the search and page events all fire in
+    the first ~300ms. Streaming does not make the answer arrive sooner, it makes
+    the first sentence arrive ~10x sooner, which is the number a user feels.
+
+    Consumers that do not know this event ignore it and still get the final
+    answer in the `done` payload, so this is additive.
+    """
+    if text:
+        emit({"type": "answer_delta", "text": text})
+
+
 def _run_oneshot_gemini(question, emit, max_steps, trace, api_key: str | None = None) -> dict:
-    """Search once, attach top page JPEGs, one generateContent — no tool loop."""
+    """Search once, attach top page screenshots, one streamed generateContent."""
     from google.genai import types
 
     client = _gemini_client_for(api_key) if api_key else _gemini_client()
-    pages = _oneshot_pages(question, emit)
+    pages = _oneshot_pages(question, emit, "gemini")
     if not pages:
         return _done(NO_PAGES_PL, trace, 0, 0, 1, "gemini", GEMINI_MODEL)
 
@@ -1010,18 +1127,25 @@ def _run_oneshot_gemini(question, emit, max_steps, trace, api_key: str | None = 
         system_instruction=ONESHOT_SYSTEM,
         thinking_config=_gemini_thinking_config(types),
     )
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[types.Content(role="user", parts=parts)],
-        config=config,
-    )
+
+    chunks: list[str] = []
     tin = tout = tthink = 0
-    um = getattr(resp, "usage_metadata", None)
-    if um:
-        tin = um.prompt_token_count or 0
-        tthink = um.thoughts_token_count or 0
-        tout = (um.candidates_token_count or 0) + tthink
-    return _done(_text_of(resp) or "The model returned nothing.",
+    for chunk in client.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=[types.Content(role="user", parts=parts)],
+            config=config):
+        piece = _text_of(chunk)
+        if piece:
+            chunks.append(piece)
+            _stream_answer(emit, piece)
+        # Usage arrives cumulatively; the last chunk carrying it is authoritative.
+        um = getattr(chunk, "usage_metadata", None)
+        if um:
+            tin = um.prompt_token_count or tin
+            tthink = um.thoughts_token_count or tthink
+            tout = (um.candidates_token_count or 0) + tthink or tout
+
+    return _done("".join(chunks) or "The model returned nothing.",
                  trace, tin, tout, 1, "gemini", GEMINI_MODEL, thoughts=tthink)
 
 
@@ -1029,7 +1153,7 @@ def _run_oneshot_anthropic(question, emit, max_steps, trace, api_key: str | None
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-    pages = _oneshot_pages(question, emit)
+    pages = _oneshot_pages(question, emit, "anthropic")
     if not pages:
         return _done(NO_PAGES_PL, trace, 0, 0, 1, "anthropic", ANTHROPIC_MODEL)
 
@@ -1045,15 +1169,41 @@ def _run_oneshot_anthropic(question, emit, max_steps, trace, api_key: str | None
             },
         })
 
-    resp = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=4000,
-        system=ONESHOT_SYSTEM,
-        messages=[{"role": "user", "content": content}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    return _done(text, trace, resp.usage.input_tokens, resp.usage.output_tokens,
-                 1, "anthropic", ANTHROPIC_MODEL)
+    # ONESHOT_SYSTEM is ~1.2k tokens of Polish, byte-identical on every call,
+    # and was being re-billed at full rate every time. Caching is a prefix
+    # match, so it has to be a block with cache_control rather than a bare
+    # string. Reads cost 0.1x; the images that follow still cost full price
+    # because the retrieved set changes per question.
+    system = [{"type": "text", "text": ONESHOT_SYSTEM,
+               "cache_control": {"type": "ephemeral"}}]
+
+    kwargs: dict = {
+        "model": ANTHROPIC_MODEL,
+        # Shared between thinking and the visible answer on models where
+        # thinking is on by default, so this is not just answer length.
+        "max_tokens": 8000,
+        "system": system,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if ANTHROPIC_EFFORT:
+        # Reading a value out of a table is not a reasoning-heavy task, and the
+        # default effort spends thinking tokens (billed as output) accordingly.
+        # Sweep this against eval/ before trusting a low setting on a price
+        # matrix — cheaper is not free if it misreads a row.
+        kwargs["output_config"] = {"effort": ANTHROPIC_EFFORT}
+
+    chunks: list[str] = []
+    with client.messages.stream(**kwargs) as stream:
+        for piece in stream.text_stream:
+            chunks.append(piece)
+            _stream_answer(emit, piece)
+        final = stream.get_final_message()
+
+    u = final.usage
+    return _done("".join(chunks), trace, u.input_tokens, u.output_tokens,
+                 1, "anthropic", ANTHROPIC_MODEL,
+                 cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
+                 cache_write=getattr(u, "cache_creation_input_tokens", 0) or 0)
 
 
 # ---- Gemini ---------------------------------------------------------------
@@ -1214,11 +1364,22 @@ def _run_anthropic(question, emit, max_steps, trace, api_key: str | None = None)
                  trace, tin, tout, max_steps, "anthropic", ANTHROPIC_MODEL)
 
 
-def _done(answer, trace, tin, tout, steps, provider, model, thoughts: int = 0) -> dict:
-    usage = {"input": tin, "output": tout, "thoughts": thoughts, "cost_usd": None}
+def _done(answer, trace, tin, tout, steps, provider, model, thoughts: int = 0,
+          cache_read: int = 0, cache_write: int = 0) -> dict:
+    usage = {"input": tin, "output": tout, "thoughts": thoughts,
+             "cache_read": cache_read, "cache_write": cache_write,
+             "cost_usd": None}
     if provider == "anthropic":
         rin, rout = ANTHROPIC_RATES
-        usage["cost_usd"] = round(tin / 1e6 * rin + tout / 1e6 * rout, 4)
+        # `input_tokens` is the UNCACHED remainder only — cached tokens are
+        # reported separately and billed differently (reads 0.1x, writes 1.25x).
+        # Summing them at the full rate would overstate the bill and hide the
+        # saving the cache is there to produce.
+        usage["cost_usd"] = round(
+            tin / 1e6 * rin
+            + cache_read / 1e6 * rin * 0.1
+            + cache_write / 1e6 * rin * 1.25
+            + tout / 1e6 * rout, 4)
 
     # The reader's own citations, geometry resolved against the source PDF.
     body, raw_cites = split_citations(answer or "")

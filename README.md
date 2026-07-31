@@ -63,6 +63,58 @@ KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 .venv/bin/pixelrag serve \
 | `PIXELRAG_ASK` | `oneshot` | `oneshot` \| `agent` |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | reader model |
 | `PIXELRAG_PROVIDER` | auto | force `gemini` \| `anthropic` |
+| `ANTHROPIC_EFFORT` | `medium` | thinking depth for the read; empty = API default |
+| `PIXELRAG_ANSWER_CACHE` | `1` | reuse answers for near-identical questions |
+| `PIXELRAG_CACHE_THRESHOLD` | `0.97` | cosine cut for a cache hit |
+| `PIXELRAG_IMAGE_FIT` | `1` | downscale pages to the reader's billed resolution |
+| `PIXELRAG_IMAGE_FLOOR` | `0.85` | how much shrink `imagefit` may spend chasing a cheaper tile grid |
+| `PIXELRAG_ANTHROPIC_LONG_EDGE` | `1568` | Anthropic tier to target; `2576` sends high-res |
+
+## Cost
+
+The reader is the whole bill — retrieval is ~145ms of local CPU and free.
+
+**Measured** on this index, `gemini-3.6-flash`, 4 pages attached:
+
+| | input tokens | wall clock |
+|---|---|---|
+| cold question | 5725 | ~8.7 s |
+| repeat question (answer cache) | **0** | **~0 ms** |
+
+**Not measured** — no Anthropic credentials on this box. From the documented
+`w*h/750` rule, `claude-opus-5` sits in the high-res tier (2576px) and bills a
+200-DPI page at ~5158 tokens, which clamping to 1568px should roughly halve.
+Confirm against a real `usage.input_tokens` before believing it: the same
+reasoning applied to Gemini's published 768px-tile model predicted a 50% saving
+and delivered **exactly zero** (5725 tokens either way — the model normalises
+images before billing). Gemini tile-chasing is off by default for that reason;
+`PIXELRAG_GEMINI_TILE_CHASING=1` re-enables it if you measure otherwise.
+
+`scripts/imagefit.py` run directly prints the predicted table for your index —
+predicted, not billed. `scripts/answer_cache.py` prints hit rate and contents;
+`--clear` empties it. The cache keys on the question's embedding plus an
+exact-match namespace (model, page budget, hybrid flag, index fingerprint), so
+rebuilding the index or changing any of those misses rather than answering from
+stale pages.
+
+Measured cosine for the cache, same encoder as retrieval: identical question
+1.00, reordered 0.97, politeness prefix 0.95, synonym swap 0.90, unrelated
+question 0.24. The default `0.95` catches rewordings with a wide margin over
+anything unrelated; drop to `0.90` to catch synonym swaps if your evals support
+it.
+
+### Transcribing pages to text does not pay here — measured
+
+`scripts/transcribe.py` reads a page once into structured markdown so the reader
+never re-reads the pixels. On `gemini-3.6-flash` it **costs more than it saves**:
+transcripts averaged **1.25× the tokens of the image** across 9 pages, because
+Gemini bills any page image at a flat ~1093 tokens while text scales with
+density. A 21-column weight matrix cost 3707 tokens as markdown against 1093 as
+pixels — and tables like that are precisely the pages that answer questions.
+
+The tool is kept because the verdict is provider-specific: Anthropic bills a
+200-DPI page at ~2318–5158 tokens by area, where even the worst transcript wins.
+Run `--measure` before assuming either way. It is not wired into `rag.py`.
 
 Visual-only is the default on purpose (the experiment). Hybrid usually ranks
 better when PDFs have a text layer; turn it on with `PIXELRAG_HYBRID=1`.
@@ -75,6 +127,8 @@ better when PDFs have a text layer; turn it on with `PIXELRAG_HYBRID=1`.
 | `index/` | tiles, vectors, `text.json` |
 | `scripts/rag.py` | retrieve + reader (shared by CLI/UI) |
 | `scripts/retrieve.py` | chunk→page aggregation, RRF hybrid |
+| `scripts/imagefit.py` | downscale pages to what the reader actually bills |
+| `scripts/answer_cache.py` | reuse answers for near-identical questions |
 | `scripts/lexical.py` | BM25 over PDF text |
 | `scripts/citations.py` | quote → highlight rectangles |
 | `scripts/app.py` + `static/` | web UI |

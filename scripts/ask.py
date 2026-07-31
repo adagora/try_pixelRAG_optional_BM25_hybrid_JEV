@@ -58,7 +58,14 @@ def main():
                   f"score {h['score']:.3f}")
         return
 
+    # The answer streams to stdout as it arrives; the citation block is stripped
+    # from `result["answer"]` afterwards, so what was streamed is reprinted only
+    # when nothing streamed at all (a cache hit, or a provider without deltas).
+    streamed = False
+    nonlocal_state = {"buf": "", "shown": 0, "done": False}
+
     def show(ev):
+        nonlocal streamed
         if ev["type"] == "search":
             print(f"  ⌕ searched {ev['query']!r} — {len(ev['hits'])} hits", file=sys.stderr)
         elif ev["type"] == "tile":
@@ -66,6 +73,30 @@ def main():
                   file=sys.stderr)
         elif ev["type"] == "tile_error":
             print(f"  ! no region {ev['tile_index']}:{ev['chunk_index']}", file=sys.stderr)
+        elif ev["type"] == "answer_delta":
+            # The reader ends with a ---CYTATY--- JSONL block that split_citations
+            # strips before anyone sees it. Streaming bypasses that strip, so the
+            # cut has to happen here too — otherwise raw citation JSON scrolls
+            # past, which is exactly what the marker exists to prevent.
+            nonlocal_state["buf"] += ev["text"]
+            if nonlocal_state["done"]:
+                return
+            buf = nonlocal_state["buf"]
+            if rag.CITE_MARK in buf:
+                nonlocal_state["done"] = True
+                tail = buf.split(rag.CITE_MARK)[0]
+                text = tail[nonlocal_state["shown"]:]
+            else:
+                # Hold back a marker's worth so a split delta cannot print a
+                # partial "---CYTATY---" before we recognise it.
+                keep = max(0, len(buf) - len(rag.CITE_MARK))
+                text = buf[nonlocal_state["shown"]:keep]
+            if text:
+                if not streamed:
+                    print(file=sys.stderr)
+                    streamed = True
+                nonlocal_state["shown"] += len(text)
+                print(text, end="", flush=True)
 
     try:
         result = rag.run_agent(args.question, on_event=show,
@@ -74,14 +105,25 @@ def main():
     except requests.RequestException as e:
         sys.exit(f"Search API unreachable on {rag.SEARCH_API}: {e}")
 
-    print()
-    print(result["answer"])
+    if streamed:
+        print()
+    else:
+        print()
+        print(result["answer"])
+
     u = result["usage"]
     cost = f" — about ${u['cost_usd']:.3f}" if u["cost_usd"] is not None else ""
     thoughts = u.get("thoughts") or 0
     think = f" · {thoughts} think" if thoughts else ""
+    cached = ""
+    if result.get("cached"):
+        cached = f" · CACHED (cos {result['cache_similarity']:.3f})"
+    cache_tok = ""
+    if u.get("cache_read"):
+        cache_tok = f" · {u['cache_read']} cache-read"
     print(f"\n[{result['provider']}/{result['model']} · {result['steps']} round trips · "
-          f"{u['input']} in / {u['output']} out{think}{cost}]", file=sys.stderr)
+          f"{u['input']} in / {u['output']} out{think}{cache_tok}{cost}{cached}]",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":

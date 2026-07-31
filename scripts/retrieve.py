@@ -283,9 +283,24 @@ def retrieve_pages(search_fn, question: str, tiles_dir: str,
     Returns (top pages, per-retriever debug rows).
     """
     variants = query_variants(question)
+
+    # Concurrently, because the two phrasings are independent and each costs an
+    # encode: sequentially that is ~2x140ms of pure wall clock on the critical
+    # path, for work that has no reason to be ordered. The encoder sidecar is an
+    # HTTP call so the GIL is released; the in-process fallback queues onto its
+    # own model thread and simply serialises, which is correct rather than fast.
+    # executor.map preserves order, which fuse() depends on — variant 0 is the
+    # question as asked and carries the ranking the others are compared against.
+    if len(variants) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+            hit_lists = list(pool.map(lambda v: search_fn(v, per_query), variants))
+    else:
+        hit_lists = [search_fn(variants[0], per_query)]
+
     rankings, debug = [], []
-    for v in variants:
-        hits = search_fn(v, per_query)
+    for v, hits in zip(variants, hit_lists):
         ranked = aggregate(hits, tiles_dir)
         rankings.append(ranked)
         debug.append({

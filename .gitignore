@@ -13,6 +13,13 @@ index/_probe/
 index/embeddings/partial_*.npz
 index/embeddings/checkpoint.json
 
+# derived caches — regenerated on demand, and the answer cache is keyed to a
+# specific index build, so it is meaningless on another machine
+index/tiles/_fit/
+index/answer_cache.npz
+index/answer_cache.json
+index/transcripts/
+
 # service logs (serve_all.py)
 logs/
 logs_serveall.log
