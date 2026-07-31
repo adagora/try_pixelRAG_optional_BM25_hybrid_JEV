@@ -67,15 +67,30 @@ def test_gemini_target_prefers_least_shrink_among_equal_grids():
 
 
 def test_target_size_is_identity_for_an_unknown_provider():
-    assert imagefit.target_size(*A4_200DPI, "someone-else") == A4_200DPI
+    assert imagefit.target_size(*A4_200DPI, imagefit.PASSTHROUGH) == A4_200DPI
 
 
-def test_target_size_gemini_is_a_no_op_unless_tile_chasing_is_on(monkeypatch):
+def test_gemini_policy_is_a_no_op_unless_tile_chasing_is_on():
     """Measured to save zero tokens on gemini-3.6-flash, so it is off."""
-    monkeypatch.setattr(imagefit, "GEMINI_TILE_CHASING", False)
-    assert imagefit.target_size(*A4_200DPI, "gemini") == A4_200DPI
-    monkeypatch.setattr(imagefit, "GEMINI_TILE_CHASING", True)
-    assert imagefit.target_size(*A4_200DPI, "gemini") != A4_200DPI
+    off = imagefit.Policy("gemini", "tiles", tile_chasing=False)
+    on = imagefit.Policy("gemini", "tiles", tile_chasing=True)
+    assert off.target(*A4_200DPI) == A4_200DPI
+    assert on.target(*A4_200DPI) != A4_200DPI
+
+
+def test_policy_reports_what_its_reader_would_bill():
+    assert imagefit.GEMINI_POLICY.tokens(*A4_200DPI) == \
+        imagefit.gemini_tokens(*A4_200DPI)
+    assert imagefit.ANTHROPIC_POLICY.tokens(*A4_200DPI) == \
+        imagefit.anthropic_tokens(*A4_200DPI, imagefit.ANTHROPIC_LONG_EDGE)
+    assert imagefit.PASSTHROUGH.tokens(*A4_200DPI) == 0
+
+
+def test_cache_key_part_covers_every_output_affecting_knob():
+    """Two policies that size differently must not share cached bytes."""
+    a = imagefit.Policy("x", "long_edge", long_edge=1568)
+    b = imagefit.Policy("x", "long_edge", long_edge=2576)
+    assert a.cache_key_part != b.cache_key_part
 
 
 # -- the resize itself ------------------------------------------------------
@@ -98,34 +113,34 @@ def _size(data):
 
 def test_fit_downscales_for_anthropic(page, tmp_path, monkeypatch):
     monkeypatch.setattr(imagefit, "CACHE_DIR", tmp_path / "fit")
-    data, mime = imagefit.fit(page, "anthropic")
+    data, mime = imagefit.fit(page, imagefit.ANTHROPIC_POLICY)
     assert mime == "image/jpeg"
     assert max(_size(data)) == imagefit.ANTHROPIC_LONG_EDGE
 
 
 def test_fit_keeps_original_pixels_for_gemini(page, tmp_path, monkeypatch):
     monkeypatch.setattr(imagefit, "CACHE_DIR", tmp_path / "fit")
-    data, _ = imagefit.fit(page, "gemini")
+    data, _ = imagefit.fit(page, imagefit.GEMINI_POLICY)
     assert _size(data) == A4_200DPI
 
 
 def test_fit_is_cached_on_disk(page, tmp_path, monkeypatch):
     monkeypatch.setattr(imagefit, "CACHE_DIR", tmp_path / "fit")
-    first, _ = imagefit.fit(page, "anthropic")
+    first, _ = imagefit.fit(page, imagefit.ANTHROPIC_POLICY)
     cached = list((tmp_path / "fit" / "anthropic").glob("*.jpg"))
     assert len(cached) == 1
-    assert imagefit.fit(page, "anthropic")[0] == first
+    assert imagefit.fit(page, imagefit.ANTHROPIC_POLICY)[0] == first
 
 
-def test_cache_key_changes_with_every_output_affecting_knob(page, monkeypatch):
-    base = imagefit._cache_key(page, "anthropic")
-    monkeypatch.setattr(imagefit, "ANTHROPIC_LONG_EDGE", 2576)
-    assert imagefit._cache_key(page, "anthropic") != base
+def test_cache_key_changes_with_the_policy(page):
+    base = imagefit._cache_key(page, imagefit.ANTHROPIC_POLICY)
+    hires = imagefit.Policy("anthropic", "long_edge", long_edge=2576)
+    assert imagefit._cache_key(page, hires) != base
 
 
 def test_fit_disabled_returns_the_file_untouched(page, monkeypatch):
     monkeypatch.setattr(imagefit, "ENABLED", False)
-    assert imagefit.fit(page, "anthropic")[0] == page.read_bytes()
+    assert imagefit.fit(page, imagefit.ANTHROPIC_POLICY)[0] == page.read_bytes()
 
 
 def test_fit_falls_back_to_original_bytes_on_a_broken_image(tmp_path, monkeypatch):
@@ -134,4 +149,4 @@ def test_fit_falls_back_to_original_bytes_on_a_broken_image(tmp_path, monkeypatc
     monkeypatch.setattr(imagefit, "CACHE_DIR", tmp_path / "fit")
     bad = tmp_path / "tile_0001.jpg"
     bad.write_bytes(b"not a jpeg")
-    assert imagefit.fit(bad, "anthropic")[0] == b"not a jpeg"
+    assert imagefit.fit(bad, imagefit.ANTHROPIC_POLICY)[0] == b"not a jpeg"

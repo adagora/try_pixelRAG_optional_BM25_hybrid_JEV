@@ -28,6 +28,7 @@ import encoder_device
 import imagefit
 import layout
 import pagehit
+import providers
 
 # One connection pool for the process. A search makes at least two HTTP calls
 # (encode, then /search) and each used to open, use and discard its own socket:
@@ -86,81 +87,16 @@ def _per_query(n_pages: int) -> int:
 # ceiling, and if this experiment graduates, flip the default with it.
 HYBRID = os.environ.get("PIXELRAG_HYBRID", "0").strip().lower() in ("1", "true", "yes")
 
-# Override either with an env var; see list_models() to see what a key can reach.
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5")
-# Thinking depth for the one-shot read. Empty = the API default (high).
-#
-# Worth setting, because thinking is ON BY DEFAULT on Opus 5 and thinking
-# tokens bill as OUTPUT ($25/M) — a "read this cell and quote it" task was
-# silently paying reasoning rates. `medium` is the starting point, not a
-# conclusion: sweep low/medium/high with evaluate_pl.py before settling, since
-# the whole ONESHOT_SYSTEM prompt exists because misreading a row is expensive.
-ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium").strip().lower()
-# 3.6 Flash: fewer agent turns/tool calls than 3.5 Flash, stronger multimodal
-# (price matrices), cheaper output. Override: GEMINI_MODEL=gemini-3.5-flash-lite
-# for max throughput (set GEMINI_THINKING=medium if tool loops truncate early).
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-# Unset → API default (medium on 3.6 Flash / minimal on 3.5 Flash-Lite).
-# We pin low: browse loops re-send every tile image each turn, so thinking
-# cost compounds. Override: GEMINI_THINKING=minimal|low|medium|high.
-GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "low").strip().lower()
-
-# Anthropic list price for the default model, $/1M tokens. Gemini pricing varies
-# by model and tier, so that path reports tokens only rather than guess a rate.
-ANTHROPIC_RATES = (5.0, 25.0)
-
-
-def detect_provider(api_key: str | None = None) -> str:
-    """Pick gemini or anthropic.
-
-    A key pasted in the UI wins over shell env — otherwise an exported
-    ANTHROPIC_API_KEY steals Gemini pastes and surfaces as a cryptic
-    APIConnectionError against api.anthropic.com.
-    """
-    forced = os.environ.get("PIXELRAG_PROVIDER", "").strip().lower()
-    if forced:
-        return forced
-    key = (api_key or "").strip()
-    if key.startswith("AIza") or key.startswith("ya29."):
-        return "gemini"
-    if key.startswith("sk-ant"):
-        return "anthropic"
-    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-        return "gemini"
-    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-        return "anthropic"
-    return "gemini"
-
-
-@lru_cache(maxsize=1)
-def _gemini_client_for(key: str):
-    from google import genai
-
-    return genai.Client(api_key=key)
-
-
-def _gemini_client():
-    """Cached — a transient Client is GC'd mid-call, closing its httpx session
-    ("Cannot send a request, as the client has been closed")."""
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not key:
-        raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY).")
-    return _gemini_client_for(key)
+# Which backend answers, and what it costs, lives in providers.py — model names,
+# thinking/effort settings, token accounting, image sizing and the SDK calls.
+# Re-exported here because ask.py and the tests reach for them by these names.
+detect_provider = providers.detect
 
 
 def list_models(provider: str | None = None) -> list[str]:
     """What the configured key can actually reach — model names drift."""
-    provider = provider or detect_provider()
-    if provider == "gemini":
-        out = []
-        for m in _gemini_client().models.list():
-            actions = getattr(m, "supported_actions", None) or []
-            if not actions or "generateContent" in actions:
-                out.append(m.name.removeprefix("models/"))
-        return sorted(out)
-    import anthropic
+    return providers.reader_for(provider).models()
 
-    return sorted(m.id for m in anthropic.Anthropic().models.list())
 
 SYSTEM = """You answer questions about a manufacturing company's own documentation
 (gates, doors, and components) by *reading screenshot tiles* of its catalogues,
@@ -785,7 +721,7 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
     if mode not in ("oneshot", "agent"):
         raise ValueError(f"Unknown ask mode {mode!r} (expected oneshot or agent).")
 
-    provider = (provider or detect_provider(api_key)).lower()
+    reader = providers.reader_for(provider, api_key)
     trace: list[dict] = []
 
     def emit(ev):
@@ -793,22 +729,13 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
         if on_event:
             on_event(ev)
 
-    if mode == "oneshot":
-        runner = {"gemini": _run_oneshot_gemini,
-                  "anthropic": _run_oneshot_anthropic}.get(provider)
-    else:
-        runner = {"gemini": _run_gemini, "anthropic": _run_anthropic}.get(provider)
-    if runner is None:
-        raise RuntimeError(f"Unknown provider {provider!r} (expected gemini or anthropic).")
-
     # The question's embedding is needed by retrieval anyway ~140ms from now, so
     # asking for it here is free (it is memoised) and buys a lookup that can
     # skip the entire reader call. Agent mode is excluded: its value is the
     # browse trace, and replaying a canned one would be a lie.
-    key = None
+    key = ns = None
     if mode == "oneshot":
-        model = GEMINI_MODEL if provider == "gemini" else ANTHROPIC_MODEL
-        ns = _cache_namespace(provider, model, mode)
+        ns = _cache_namespace(reader.name, reader.model, mode)
         try:
             key = embed_query(question.strip())
         except Exception:
@@ -818,16 +745,64 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
             if hit is not None:
                 return _replay(hit, emit)
 
-    result = runner(question, emit, max_steps, trace, api_key=api_key)
+    if mode == "oneshot":
+        result = _read_once(reader, question, emit, trace)
+    else:
+        result = _browse(reader, question, emit, trace, max_steps)
 
-    # Never cache a non-answer: "no pages matched" is usually a transient
-    # search-service problem, and pinning it would keep answering that way.
-    if key is not None and result.get("answer") and result.get("trace"):
+    if key is not None and _worth_caching(result):
         try:
             answer_cache.default().put(key, question.strip(), ns, result)
         except Exception:
             pass                # a cache write must not fail a good answer
     return result
+
+
+def _worth_caching(result: dict) -> bool:
+    """Was this an answer, or a report that there was nothing to answer from?
+
+    Never cache the latter: "no pages matched" is usually a transient
+    search-service problem, and pinning it keeps answering that way.
+
+    A non-empty `trace` is NOT that signal, though it was used as one. The
+    search event fires before page selection and fires even when retrieval
+    returned nothing, so the trace is never empty and the non-answer was cached
+    every time — one search outage became a permanent wrong answer for every
+    rephrasing in that namespace, until the index was rebuilt or the cache
+    cleared by hand. A `tile` event is the real signal: it means at least one
+    page actually reached the reader.
+    """
+    return bool(result.get("answer")) and any(
+        e.get("type") == "tile" for e in result.get("trace") or [])
+
+
+def _read_once(reader, question: str, emit, trace: list[dict]) -> dict:
+    """One-shot: retrieve pages, attach them, one streamed read.
+
+    Provider-independent by construction — everything below this line is the
+    same for every backend, and everything that is not lives in providers.py.
+    """
+    pages = _oneshot_pages(question, emit, reader.image_policy)
+    if not pages:
+        return _done(NO_PAGES_PL, trace, providers.Usage(), 1, reader)
+
+    reply = reader.read_pages(
+        system=ONESHOT_SYSTEM,
+        preamble=_oneshot_preamble(question, pages),
+        pages=pages,
+        header_of=_page_header,
+        on_text=lambda piece: _stream_answer(emit, piece),
+    )
+    return _done(reply.text, trace, reply.usage, reply.steps, reader)
+
+
+def _browse(reader, question: str, emit, trace: list[dict],
+            max_steps: int) -> dict:
+    """Agent mode: the reader drives, opening regions until it can answer."""
+    reply = reader.browse(
+        system=SYSTEM, question=question, tools=TOOLS,
+        dispatch=_dispatch, on_event=emit, max_steps=max_steps)
+    return _done(reply.text, trace, reply.usage, reply.steps, reader)
 
 
 def _lexical_fn():
@@ -879,7 +854,7 @@ def _hit_row(p: pagehit.PageHit) -> dict:
     }
 
 
-def _oneshot_pages(question: str, emit, provider: str,
+def _oneshot_pages(question: str, emit, policy: imagefit.Policy,
                    n_pages: int = ONESHOT_PAGES) -> list[dict]:
     """Hybrid search → best whole pages (retrieve, fuse, read pages).
 
@@ -917,7 +892,7 @@ def _oneshot_pages(question: str, emit, provider: str,
         # Sized for whoever is about to read it. The rendered page is 200 DPI;
         # every provider bills a smaller number than that, and Gemini's is a
         # step function with a cliff just below A4 — see imagefit.
-        img, mime = imagefit.fit(path, provider)
+        img, mime = imagefit.fit(path, policy)
 
         # The wire contract, stated once. Consumers: ask.py's trace printer and
         # index.html's SSE handler. It carries no image bytes — the UI fetches
@@ -1100,277 +1075,15 @@ def _stream_answer(emit, text: str) -> None:
         emit({"type": "answer_delta", "text": text})
 
 
-def _run_oneshot_gemini(question, emit, max_steps, trace, api_key: str | None = None) -> dict:
-    """Search once, attach top page screenshots, one streamed generateContent."""
-    from google.genai import types
+def _done(answer: str, trace: list[dict], usage: providers.Usage, steps: int,
+          reader) -> dict:
+    """Assemble the answer payload: prose, citations, cost, trace.
 
-    client = _gemini_client_for(api_key) if api_key else _gemini_client()
-    pages = _oneshot_pages(question, emit, "gemini")
-    if not pages:
-        return _done(NO_PAGES_PL, trace, 0, 0, 1, "gemini", GEMINI_MODEL)
-
-    parts: list = [types.Part.from_text(text=_oneshot_preamble(question, pages))]
-    for p in pages:
-        parts.append(types.Part.from_text(text=_page_header(p)))
-        parts.append(types.Part.from_bytes(data=p["image"], mime_type=p["mime"]))
-
-    config = types.GenerateContentConfig(
-        system_instruction=ONESHOT_SYSTEM,
-        thinking_config=_gemini_thinking_config(types),
-    )
-
-    chunks: list[str] = []
-    tin = tout = tthink = 0
-    for chunk in client.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=[types.Content(role="user", parts=parts)],
-            config=config):
-        piece = _text_of(chunk)
-        if piece:
-            chunks.append(piece)
-            _stream_answer(emit, piece)
-        # Usage arrives cumulatively; the last chunk carrying it is authoritative.
-        um = getattr(chunk, "usage_metadata", None)
-        if um:
-            tin = um.prompt_token_count or tin
-            tthink = um.thoughts_token_count or tthink
-            tout = (um.candidates_token_count or 0) + tthink or tout
-
-    return _done("".join(chunks) or "The model returned nothing.",
-                 trace, tin, tout, 1, "gemini", GEMINI_MODEL, thoughts=tthink)
-
-
-def _run_oneshot_anthropic(question, emit, max_steps, trace, api_key: str | None = None) -> dict:
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-    pages = _oneshot_pages(question, emit, "anthropic")
-    if not pages:
-        return _done(NO_PAGES_PL, trace, 0, 0, 1, "anthropic", ANTHROPIC_MODEL)
-
-    content: list = [{"type": "text", "text": _oneshot_preamble(question, pages)}]
-    for p in pages:
-        content.append({"type": "text", "text": _page_header(p)})
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": p["mime"],
-                "data": base64.standard_b64encode(p["image"]).decode(),
-            },
-        })
-
-    # ONESHOT_SYSTEM is ~1.2k tokens of Polish, byte-identical on every call,
-    # and was being re-billed at full rate every time. Caching is a prefix
-    # match, so it has to be a block with cache_control rather than a bare
-    # string. Reads cost 0.1x; the images that follow still cost full price
-    # because the retrieved set changes per question.
-    system = [{"type": "text", "text": ONESHOT_SYSTEM,
-               "cache_control": {"type": "ephemeral"}}]
-
-    kwargs: dict = {
-        "model": ANTHROPIC_MODEL,
-        # Shared between thinking and the visible answer on models where
-        # thinking is on by default, so this is not just answer length.
-        "max_tokens": 8000,
-        "system": system,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if ANTHROPIC_EFFORT:
-        # Reading a value out of a table is not a reasoning-heavy task, and the
-        # default effort spends thinking tokens (billed as output) accordingly.
-        # Sweep this against eval/ before trusting a low setting on a price
-        # matrix — cheaper is not free if it misreads a row.
-        kwargs["output_config"] = {"effort": ANTHROPIC_EFFORT}
-
-    chunks: list[str] = []
-    with client.messages.stream(**kwargs) as stream:
-        for piece in stream.text_stream:
-            chunks.append(piece)
-            _stream_answer(emit, piece)
-        final = stream.get_final_message()
-
-    u = final.usage
-    return _done("".join(chunks), trace, u.input_tokens, u.output_tokens,
-                 1, "anthropic", ANTHROPIC_MODEL,
-                 cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
-                 cache_write=getattr(u, "cache_creation_input_tokens", 0) or 0)
-
-
-# ---- Gemini ---------------------------------------------------------------
-
-def _gemini_thinking_config(types):
-    """Map GEMINI_THINKING → ThinkingConfig. Unknown values fall back to low."""
-    level = {
-        "minimal": types.ThinkingLevel.MINIMAL,
-        "low": types.ThinkingLevel.LOW,
-        "medium": types.ThinkingLevel.MEDIUM,
-        "high": types.ThinkingLevel.HIGH,
-    }.get(GEMINI_THINKING, types.ThinkingLevel.LOW)
-    return types.ThinkingConfig(thinking_level=level)
-
-
-def _run_gemini(question, emit, max_steps, trace, api_key: str | None = None) -> dict:
-    from google.genai import types
-
-    client = _gemini_client_for(api_key) if api_key else _gemini_client()
-    decls = [
-        types.FunctionDeclaration(name=t["name"], description=t["description"],
-                                  parameters_json_schema=t["input_schema"])
-        for t in TOOLS
-    ]
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM,
-        tools=[types.Tool(function_declarations=decls)],
-        # We drive the loop ourselves so the UI can stream each step.
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        thinking_config=_gemini_thinking_config(types),
-    )
-    contents = [types.Content(role="user", parts=[types.Part.from_text(text=question)])]
-    tin = tout = tthink = 0
-
-    for step in range(max_steps):
-        resp = client.models.generate_content(
-            model=GEMINI_MODEL, contents=contents, config=config)
-        um = getattr(resp, "usage_metadata", None)
-        if um:
-            tin += um.prompt_token_count or 0
-            thoughts = um.thoughts_token_count or 0
-            tthink += thoughts
-            tout += (um.candidates_token_count or 0) + thoughts
-
-        cand = (resp.candidates or [None])[0]
-        if cand is None or not cand.content or not cand.content.parts:
-            return _done(_text_of(resp) or "The model returned nothing.",
-                         trace, tin, tout, step + 1, "gemini", GEMINI_MODEL,
-                         thoughts=tthink)
-
-        contents.append(cand.content)
-        calls = [p.function_call for p in cand.content.parts if p.function_call]
-        if not calls:
-            return _done(_text_of(resp), trace, tin, tout, step + 1, "gemini",
-                         GEMINI_MODEL, thoughts=tthink)
-
-        reply_parts = []
-        for call in calls:
-            args = dict(call.args or {})
-            try:
-                result, ev = _dispatch(call.name, args)
-            except Exception as e:
-                result, ev = {"ok": False, "message": f"{type(e).__name__}: {e}"}, None
-            if ev:
-                emit(ev)
-
-            if isinstance(result, dict) and result.get("ok"):
-                # Gemini tool results carry images natively via inline_data.
-                reply_parts.append(types.Part.from_function_response(
-                    name=call.name,
-                    response={"status": "ok", "description": result["label"]},
-                    parts=[types.FunctionResponsePart(
-                        inline_data=types.FunctionResponseBlob(
-                            mime_type=result["mime"], data=result["image"]))],
-                ))
-            elif isinstance(result, dict):
-                reply_parts.append(types.Part.from_function_response(
-                    name=call.name, response={"status": "error",
-                                              "message": result.get("message", "failed")}))
-            else:
-                reply_parts.append(types.Part.from_function_response(
-                    name=call.name, response={"status": "ok", "results": result}))
-        contents.append(types.Content(role="user", parts=reply_parts))
-
-    return _done("Stopped after the step limit without settling on an answer.",
-                 trace, tin, tout, max_steps, "gemini", GEMINI_MODEL,
-                 thoughts=tthink)
-
-
-def _text_of(resp) -> str:
-    cand = (resp.candidates or [None])[0]
-    if not cand or not cand.content or not cand.content.parts:
-        return ""
-    return "".join(p.text for p in cand.content.parts if getattr(p, "text", None))
-
-
-# ---- Anthropic ------------------------------------------------------------
-
-def _run_anthropic(question, emit, max_steps, trace, api_key: str | None = None) -> dict:
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-    messages = [{"role": "user", "content": question}]
-    tin = tout = 0
-
-    for step in range(max_steps):
-        resp = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            # Thinking is on by default on Opus 5 and shares this budget with
-            # the visible answer, so leave headroom.
-            max_tokens=8000,
-            system=SYSTEM,
-            tools=TOOLS,
-            messages=messages,
-        )
-        tin += resp.usage.input_tokens
-        tout += resp.usage.output_tokens
-
-        # A refusal returns HTTP 200 with empty/partial content — check first.
-        if resp.stop_reason == "refusal":
-            return _done(f"The model declined this request ({resp.stop_details}).",
-                         trace, tin, tout, step + 1, "anthropic", ANTHROPIC_MODEL)
-
-        messages.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
-            text = "".join(b.text for b in resp.content if b.type == "text")
-            return _done(text, trace, tin, tout, step + 1, "anthropic", ANTHROPIC_MODEL)
-
-        results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            try:
-                result, ev = _dispatch(block.name, dict(block.input))
-            except Exception as e:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": f"{type(e).__name__}: {e}", "is_error": True})
-                continue
-            if ev:
-                emit(ev)
-
-            if isinstance(result, dict) and result.get("ok"):
-                content = [
-                    {"type": "text", "text": result["label"] + ":"},
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": result["mime"],
-                        "data": base64.standard_b64encode(result["image"]).decode()}},
-                ]
-            elif isinstance(result, dict):
-                content = result.get("message", "failed")
-            else:
-                content = result
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": content})
-        messages.append({"role": "user", "content": results})
-
-    return _done("Stopped after the step limit without settling on an answer.",
-                 trace, tin, tout, max_steps, "anthropic", ANTHROPIC_MODEL)
-
-
-def _done(answer, trace, tin, tout, steps, provider, model, thoughts: int = 0,
-          cache_read: int = 0, cache_write: int = 0) -> dict:
-    usage = {"input": tin, "output": tout, "thoughts": thoughts,
-             "cache_read": cache_read, "cache_write": cache_write,
-             "cost_usd": None}
-    if provider == "anthropic":
-        rin, rout = ANTHROPIC_RATES
-        # `input_tokens` is the UNCACHED remainder only — cached tokens are
-        # reported separately and billed differently (reads 0.1x, writes 1.25x).
-        # Summing them at the full rate would overstate the bill and hide the
-        # saving the cache is there to produce.
-        usage["cost_usd"] = round(
-            tin / 1e6 * rin
-            + cache_read / 1e6 * rin * 0.1
-            + cache_write / 1e6 * rin * 1.25
-            + tout / 1e6 * rout, 4)
+    Pricing is the reader's own business — an unpriced provider returns None
+    rather than having a rate guessed for it here.
+    """
+    usage_out = usage.as_dict(reader.price(usage))
+    provider, model = reader.name, reader.model
 
     # The reader's own citations, geometry resolved against the source PDF.
     body, raw_cites = split_citations(answer or "")
@@ -1394,6 +1107,6 @@ def _done(answer, trace, tin, tout, steps, provider, model, thoughts: int = 0,
             except Exception:
                 pass
 
-    return {"answer": body, "trace": trace, "usage": usage, "steps": steps,
+    return {"answer": body, "trace": trace, "usage": usage_out, "steps": steps,
             "provider": provider, "model": model, "pins": pins,
             "citations": cites}

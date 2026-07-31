@@ -74,6 +74,7 @@ from pathlib import Path
 
 import imagefit
 import layout
+import providers
 import rag
 
 OUT = layout._anchored(os.environ.get("PIXELRAG_TRANSCRIPTS", ""),
@@ -154,7 +155,7 @@ def _pages() -> list[tuple[int, int, Path]]:
 
 
 def _transcribe_one(client, types, path: Path, model: str) -> tuple[str, int, int]:
-    img, mime = imagefit.fit(path, "gemini")
+    img, mime = imagefit.fit(path, providers.GeminiReader().image_policy)
     resp = client.models.generate_content(
         model=model,
         contents=[types.Content(role="user", parts=[
@@ -172,14 +173,15 @@ def _transcribe_one(client, types, path: Path, model: str) -> tuple[str, int, in
     um = getattr(resp, "usage_metadata", None)
     tin = (um.prompt_token_count or 0) if um else 0
     tout = (um.candidates_token_count or 0) if um else 0
-    return rag._text_of(resp), tin, tout
+    return providers.text_of(resp), tin, tout
 
 
 def run(limit: int | None, article: int | None, force: bool) -> None:
     from google.genai import types
 
-    model = rag.GEMINI_MODEL
-    client = rag._gemini_client()
+    reader = providers.GeminiReader()
+    model = reader.model
+    client = reader._client()
     manifest = _load_manifest()
 
     todo = [(a, t, p) for a, t, p in _pages()
@@ -229,8 +231,9 @@ def measure() -> None:
     """
     from google.genai import types
 
-    model = rag.GEMINI_MODEL
-    client = rag._gemini_client()
+    reader = providers.GeminiReader()
+    model = reader.model
+    client = reader._client()
     manifest = _load_manifest()
     done = [k for k in manifest]
     if not done:
@@ -245,7 +248,7 @@ def measure() -> None:
         path = rag.page_path(aid, tile)
         text = load(aid, tile) or ""
 
-        img, mime = imagefit.fit(path, "gemini")
+        img, mime = imagefit.fit(path, providers.GeminiReader().image_policy)
         n_img = client.models.count_tokens(
             model=model,
             contents=[types.Content(role="user", parts=[

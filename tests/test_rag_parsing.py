@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+import providers
 import rag
 
 
@@ -129,27 +130,29 @@ def test_cache_namespace_includes_the_index_identity():
 def test_anthropic_cost_bills_cached_tokens_at_their_own_rate():
     """input_tokens is the UNCACHED remainder; summing everything at full rate
     would overstate the bill and hide the saving the cache exists to produce."""
-    r = rag._done("a", [], tin=1_000_000, tout=0, steps=1,
-                  provider="anthropic", model="m",
-                  cache_read=1_000_000, cache_write=1_000_000)
-    rin, rout = rag.ANTHROPIC_RATES
+    r = rag._done("a", [], providers.Usage(input=1_000_000, output=0,
+                                           cache_read=1_000_000,
+                                           cache_write=1_000_000),
+                  1, providers.AnthropicReader())
+    rin, _ = providers.ANTHROPIC_RATES
     assert r["usage"]["cost_usd"] == pytest.approx(rin + rin * 0.1 + rin * 1.25)
 
 
 def test_gemini_reports_tokens_but_not_a_rate():
     """Pricing varies by model and tier, so that path does not guess."""
-    r = rag._done("a", [], 100, 50, 1, "gemini", "m", thoughts=10)
+    r = rag._done("a", [], providers.Usage(input=100, output=50, thoughts=10),
+                  1, providers.GeminiReader())
     assert r["usage"]["cost_usd"] is None
     assert r["usage"]["thoughts"] == 10
 
 
-def test_done_splits_the_citation_block_out_of_the_answer():
-    r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}', [], 0, 0, 1,
-                  "gemini", "m")
+def test_done_splits_the_citation_block_out_of_the_answer(fake_reader):
+    r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}', [],
+                  providers.Usage(), 1, fake_reader())
     assert r["answer"] == "Odp."
 
 
-def test_done_never_fails_the_answer_over_highlighting(monkeypatch):
+def test_done_never_fails_the_answer_over_highlighting(monkeypatch, fake_reader):
     """Highlighting is a nicety; a broken PDF must not lose a good answer."""
     def boom(*a, **k):
         raise RuntimeError("no text layer")
@@ -157,7 +160,7 @@ def test_done_never_fails_the_answer_over_highlighting(monkeypatch):
     monkeypatch.setattr(rag, "resolve_citations", boom)
     r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}',
                   [{"type": "tile", "article_id": 0, "page": 1, "document": "d"}],
-                  0, 0, 1, "gemini", "m")
+                  providers.Usage(), 1, fake_reader())
     assert r["answer"] == "Odp." and r["citations"] == []
 
 

@@ -47,6 +47,7 @@ import hashlib
 import io
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import layout
@@ -145,33 +146,75 @@ def _anthropic_target(w: int, h: int,
     return max(1, int(w * s)), max(1, int(h * s))
 
 
-def target_size(w: int, h: int, provider: str) -> tuple[int, int]:
-    if provider == "gemini":
-        # Measured to buy no tokens on gemini-3.6-flash; the re-encode alone
-        # still trims upload bytes, so the default is "same pixels, tighter
-        # JPEG" rather than a resize.
-        return _gemini_target(w, h) if GEMINI_TILE_CHASING else (w, h)
-    if provider == "anthropic":
-        return _anthropic_target(w, h)
-    return w, h
+@dataclass(frozen=True)
+class Policy:
+    """How one reader wants its pages sized.
+
+    A policy rather than a provider name, because this module has no business
+    knowing who its callers are: it used to branch on the strings "gemini" and
+    "anthropic", which made a low-level sizing utility depend on the identity of
+    the high-level code that calls it. providers.py hands one of these over.
+
+    `name` is only a cache-directory segment and a report label.
+    """
+
+    name: str
+    kind: str                       # "tiles" | "long_edge" | "none"
+    long_edge: int = 0
+    tile_chasing: bool = False
+
+    def target(self, w: int, h: int) -> tuple[int, int]:
+        if self.kind == "tiles":
+            # Measured to buy no tokens on gemini-3.6-flash; the re-encode
+            # alone still trims upload bytes, so the default is "same pixels,
+            # tighter JPEG" rather than a resize.
+            return _gemini_target(w, h) if self.tile_chasing else (w, h)
+        if self.kind == "long_edge":
+            return _anthropic_target(w, h, self.long_edge)
+        return w, h
+
+    def tokens(self, w: int, h: int) -> int:
+        """What this reader would bill for an image of this size."""
+        if self.kind == "tiles":
+            return gemini_tokens(w, h)
+        if self.kind == "long_edge":
+            return anthropic_tokens(w, h, self.long_edge)
+        return 0
+
+    @property
+    def cache_key_part(self) -> str:
+        """Every knob that changes the OUTPUT, so flipping one cannot serve
+        bytes produced under the old setting."""
+        return f"{self.name}|{self.kind}|{self.long_edge}|{int(self.tile_chasing)}"
+
+
+GEMINI_POLICY = Policy(name="gemini", kind="tiles",
+                       tile_chasing=GEMINI_TILE_CHASING)
+ANTHROPIC_POLICY = Policy(name="anthropic", kind="long_edge",
+                          long_edge=ANTHROPIC_LONG_EDGE)
+# For a reader that has told us nothing: send the page exactly as rendered.
+PASSTHROUGH = Policy(name="passthrough", kind="none")
+
+
+def target_size(w: int, h: int, policy: Policy) -> tuple[int, int]:
+    return policy.target(w, h)
 
 
 # --------------------------------------------------------------------------
 # the resize itself
 # --------------------------------------------------------------------------
 
-def _cache_key(path: Path, provider: str) -> str:
+def _cache_key(path: Path, policy: Policy) -> str:
     st = path.stat()
     # Every knob that changes the OUTPUT belongs in the key, or flipping one
     # silently serves bytes produced under the old setting.
-    raw = (f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}|{provider}|"
-           f"{ANTHROPIC_LONG_EDGE}|{SCALE_FLOOR}|{QUALITY}|"
-           f"{int(GEMINI_TILE_CHASING)}")
+    raw = (f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}|"
+           f"{policy.cache_key_part}|{SCALE_FLOOR}|{QUALITY}")
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
-def fit(path: Path, provider: str) -> tuple[bytes, str]:
-    """Page bytes sized for `provider`, plus their mime type.
+def fit(path: Path, policy: Policy) -> tuple[bytes, str]:
+    """Page bytes sized for `policy`, plus their mime type.
 
     Falls back to the original bytes on any failure. A page that reaches the
     reader slightly too large is a cost bug; a page that does not reach it at
@@ -181,7 +224,7 @@ def fit(path: Path, provider: str) -> tuple[bytes, str]:
     if not ENABLED:
         return path.read_bytes(), "image/jpeg"
 
-    cached = CACHE_DIR / provider / f"{_cache_key(path, provider)}.jpg"
+    cached = CACHE_DIR / policy.name / f"{_cache_key(path, policy)}.jpg"
     if cached.exists():
         try:
             return cached.read_bytes(), "image/jpeg"
@@ -193,7 +236,7 @@ def fit(path: Path, provider: str) -> tuple[bytes, str]:
 
         with Image.open(path) as im:
             im = im.convert("RGB")
-            tw, th = target_size(im.width, im.height, provider)
+            tw, th = policy.target(im.width, im.height)
             resized = (tw, th) != im.size
             if resized:
                 im = im.resize((tw, th), Image.LANCZOS)

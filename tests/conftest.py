@@ -51,3 +51,63 @@ def hits():
         return [{"article_id": a, "tile_index": t, "chunk_index": c, "score": s}
                 for a, t, c, s in triples]
     return make
+
+
+@pytest.fixture
+def fake_reader():
+    """A Reader that answers from a script instead of from a model.
+
+    This is what providers.py exists for. Before the Reader protocol the answer
+    pipeline could only be exercised with a live faiss service, a live encoder
+    and a billed API call, so it had no tests at all. This class imports no SDK,
+    needs no key and touches no network, and rag.run_agent cannot tell the
+    difference.
+    """
+    import imagefit
+    import providers
+
+    class FakeReader:
+        name = "fake"
+
+        def __init__(self, answer="Odpowiedź.", usage=None, steps=1,
+                     model="fake-1", policy=None, cost=None):
+            self.model = model
+            self._answer = answer
+            self._usage = usage or providers.Usage(input=10, output=5)
+            self._steps = steps
+            self._policy = policy or imagefit.PASSTHROUGH
+            self._cost = cost
+            # What the pipeline handed over, for assertions.
+            self.system = None
+            self.preamble = None
+            self.pages = None
+            self.headers = []
+            self.calls = 0
+
+        @property
+        def image_policy(self):
+            return self._policy
+
+        def price(self, usage):
+            return self._cost
+
+        def models(self):
+            return [self.model]
+
+        def read_pages(self, system, preamble, pages, header_of, on_text):
+            self.calls += 1
+            self.system, self.preamble, self.pages = system, preamble, pages
+            self.headers = [header_of(p) for p in pages]
+            # Stream in two pieces, so a consumer that reassembles deltas is
+            # exercised the way a real provider exercises it.
+            half = len(self._answer) // 2
+            on_text(self._answer[:half])
+            on_text(self._answer[half:])
+            return providers.Reply(self._answer, self._usage, self._steps)
+
+        def browse(self, system, question, tools, dispatch, on_event, max_steps):
+            self.calls += 1
+            self.system = system
+            return providers.Reply(self._answer, self._usage, self._steps)
+
+    return FakeReader
