@@ -39,6 +39,8 @@ from pathlib import Path
 import yaml
 from pixelrag_render.backends.pdf import render_pdf
 
+import layout
+
 
 def _is_stale(tile_dir: Path, pdf: Path) -> bool:
     """True if tile_dir holds pixels from a different document than `pdf`.
@@ -60,9 +62,14 @@ def _is_stale(tile_dir: Path, pdf: Path) -> bool:
 
 
 def main():
-    cfg = yaml.safe_load(Path("pixelrag.yaml").read_text())
+    cfg = yaml.safe_load((layout.ROOT / "pixelrag.yaml").read_text())
     src = Path(cfg["source"]["path"]).expanduser()
-    tiles_dir = Path(cfg.get("output", "./index")) / "tiles"
+    # The index tree comes from pixelrag.yaml, not from PIXELRAG_INDEX_DIR:
+    # `pixelrag index` reads that file too, and the two must agree about where
+    # they are writing. Only the naming inside it is layout's business.
+    index = layout.IndexLayout(layout._anchored(cfg.get("output", "./index"),
+                                                layout.ROOT / "index"))
+    tiles_dir = index.tiles_dir
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     # Must match PDFSource exactly: sorted(path.glob("**/*.pdf")). The tile
@@ -75,7 +82,7 @@ def main():
     print(f"Pre-rendering {len(pdfs)} PDF(s) at full resolution\n")
     total_pages = 0
     for idx, pdf in enumerate(pdfs):
-        tile_dir = tiles_dir / f"{idx}.png.tiles"
+        tile_dir = index.tile_dir(idx)
 
         if _is_stale(tile_dir, pdf):
             # Drop the whole directory, not just the manifest: leftover tiles

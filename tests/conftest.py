@@ -13,14 +13,17 @@ import pytest
 
 
 @pytest.fixture
-def tiles_dir(tmp_path):
-    """A minimal tiles tree: one article, two pages, gist + region chunks.
+def index(tmp_path):
+    """A minimal index tree: one article, two pages, gist + region chunks.
 
-    Mirrors what chunk_multiscale.py writes, including the `scale` field and the
-    `{aid}.png.tiles` directory convention.
+    Written through IndexLayout rather than by hand, so a test cannot drift from
+    the convention the production code reads. Mirrors what chunk_multiscale.py
+    emits, including the `scale` field.
     """
-    d = tmp_path / "tiles" / "0.png.tiles"
-    d.mkdir(parents=True)
+    import layout
+
+    idx = layout.IndexLayout(tmp_path / "index")
+    idx.tile_dir(0).mkdir(parents=True)
     chunks = []
     for tile in (0, 1):
         chunks.append({"tile_index": tile, "chunk_index": 0, "scale": "page",
@@ -29,8 +32,16 @@ def tiles_dir(tmp_path):
             chunks.append({"tile_index": tile, "chunk_index": ci, "scale": "region",
                            "x_offset": 0, "y_offset": 500 * (ci - 1),
                            "width": 800, "height": 500})
-    (d / "chunks.json").write_text(json.dumps({"chunks": chunks}))
-    return str(tmp_path / "tiles")
+    idx.chunks_manifest(0).write_text(json.dumps({"chunks": chunks}))
+    return idx
+
+
+@pytest.fixture
+def scale_of(index):
+    """retrieve.py's ScaleFn, backed by the fixture index."""
+    import chunkmeta
+
+    return lambda a, t, c: chunkmeta.scale_of(a, t, c, index)
 
 
 @pytest.fixture

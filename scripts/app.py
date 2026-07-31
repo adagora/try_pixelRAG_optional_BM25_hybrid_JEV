@@ -57,8 +57,8 @@ def index():
 def list_docs():
     out = []
     for i, a in enumerate(rag.articles()):
-        pages = sorted((rag.TILES_DIR / f"{i}.png.tiles").glob("tile_*.jpg"))
-        out.append({"article_id": i, "title": a["title"], "pages": len(pages)})
+        out.append({"article_id": i, "title": a["title"],
+                    "pages": len(rag.LAYOUT.page_images(i))})
     return {"docs": out}
 
 

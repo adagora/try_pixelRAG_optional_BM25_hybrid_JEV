@@ -52,7 +52,7 @@ def main() -> None:
     # before they are ever embedded — so the old search-time blank mask is dead.
     # Reported here only as a check that the chunker did its job.
     total = blanks = 0
-    for d in sorted(rag.TILES_DIR.glob("*.png.tiles")):
+    for d in rag.LAYOUT.tile_dirs():
         m = d / "chunks.json"
         if not m.exists():
             continue

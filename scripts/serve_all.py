@@ -24,7 +24,10 @@ from pathlib import Path
 
 import requests
 
-ROOT = Path(__file__).resolve().parents[1]
+import layout
+
+ROOT = layout.ROOT
+INDEX = layout.DEFAULT
 PY = sys.executable
 LOGS = ROOT / "logs"
 
@@ -120,8 +123,10 @@ def main() -> None:
     fh = open(log, "w", encoding="utf-8")
     print("starting search API (faiss) …", flush=True)
     p_search = subprocess.Popen(
-        [PY, "-m", "pixelrag_serve.api", "--index-dir", "./index",
-         "--tiles-dir", "./index/tiles", "--articles-json", "./index/articles.json",
+        [PY, "-m", "pixelrag_serve.api",
+         "--index-dir", str(INDEX.index_dir),
+         "--tiles-dir", str(INDEX.tiles_dir),
+         "--articles-json", str(INDEX.articles_json),
          "--port", str(SEARCH_PORT), "--device", "cpu"],
         stdout=fh, stderr=subprocess.STDOUT, env=search_env_note, cwd=ROOT)
     procs.append(("search API", p_search, log))

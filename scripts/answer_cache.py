@@ -54,13 +54,21 @@ from pathlib import Path
 
 import numpy as np
 
+import layout
+
 ENABLED = os.environ.get("PIXELRAG_ANSWER_CACHE", "1") != "0"
 THRESHOLD = float(os.environ.get("PIXELRAG_CACHE_THRESHOLD", "0.95"))
 MAX_ENTRIES = int(os.environ.get("PIXELRAG_CACHE_MAX", "2000"))
 
-CACHE_DIR = Path(os.environ.get("PIXELRAG_CACHE_DIR", "index"))
-VEC_PATH = CACHE_DIR / "answer_cache.npz"
-META_PATH = CACHE_DIR / "answer_cache.json"
+# Beside the index by default, because an entry is only valid for the index it
+# was read out of (see index_fingerprint). PIXELRAG_CACHE_DIR moves it; a
+# relative value is anchored to the repo root, not to the working directory.
+_CACHE_LAYOUT = layout.IndexLayout(
+    layout._anchored(os.environ.get("PIXELRAG_CACHE_DIR", ""),
+                     layout.DEFAULT.index_dir))
+CACHE_DIR = _CACHE_LAYOUT.index_dir
+VEC_PATH = _CACHE_LAYOUT.answer_cache_vectors
+META_PATH = _CACHE_LAYOUT.answer_cache_meta
 
 
 def index_fingerprint(index_dir: Path) -> str:

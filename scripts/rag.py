@@ -23,8 +23,10 @@ from pathlib import Path
 import requests
 
 import answer_cache
+import chunkmeta
 import encoder_device
 import imagefit
+import layout
 
 # One connection pool for the process. A search makes at least two HTTP calls
 # (encode, then /search) and each used to open, use and discard its own socket:
@@ -32,8 +34,12 @@ import imagefit
 _HTTP = requests.Session()
 
 SEARCH_API = "http://127.0.0.1:30001"
-INDEX_DIR = Path("index")
-TILES_DIR = INDEX_DIR / "tiles"
+# Where the index lives, and the only thing that knows how it is laid out.
+# Anchored to the repo root, so a CLI invoked from another directory still finds
+# it — see layout.py.
+LAYOUT = layout.DEFAULT
+INDEX_DIR = LAYOUT.index_dir
+TILES_DIR = LAYOUT.tiles_dir
 MAX_STEPS = 10
 # Ask modes — both PixelRAG-native:
 #   oneshot  search → attach top page screenshots → one VLM call (default)
@@ -271,7 +277,7 @@ Zacznij od odpowiedzi. Bez wstępów."""
 
 @lru_cache(maxsize=None)
 def articles() -> list[dict]:
-    arts = json.loads((INDEX_DIR / "articles.json").read_text())
+    arts = json.loads(LAYOUT.articles_json.read_text(encoding="utf-8"))
     # Index may have been built on Windows (`pdfs\\foo.pdf`); Path on macOS/Linux
     # treats that as a single filename with a backslash, so the source is "missing".
     for a in arts:
@@ -286,31 +292,8 @@ def doc_title(article_id: int) -> str:
     return a[article_id]["title"] if article_id < len(a) else "?"
 
 
-@lru_cache(maxsize=None)
-def _chunk_boxes(article_id: int) -> dict[tuple[int, int], dict]:
-    """(tile_index, chunk_index) -> pixel box of that chunk within its page.
-
-    chunk.py records x_offset; the stock PDF path omits it (its single chunk
-    always starts at x=0), hence the .get default.
-    """
-    manifest = TILES_DIR / f"{article_id}.png.tiles" / "chunks.json"
-    if not manifest.exists():
-        return {}
-    try:
-        chunks = json.loads(manifest.read_text()).get("chunks", [])
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return {
-        (c.get("tile_index", 0), c.get("chunk_index", 0)): {
-            "x": c.get("x_offset", 0), "y": c.get("y_offset", 0),
-            "w": c.get("width", 0), "h": c.get("height", 0),
-        }
-        for c in chunks
-    }
-
-
 def page_path(article_id: int, tile_index: int) -> Path:
-    return TILES_DIR / f"{article_id}.png.tiles" / f"tile_{tile_index:04d}.jpg"
+    return LAYOUT.page_image(article_id, tile_index)
 
 
 @lru_cache(maxsize=None)
@@ -323,13 +306,13 @@ def page_size(article_id: int, tile_index: int) -> tuple[int, int]:
 
 def box_pct(article_id: int, tile_index: int, chunk_index: int) -> dict | None:
     """Chunk box as percentages of the page, for overlaying in the UI."""
-    box = _chunk_boxes(article_id).get((tile_index, chunk_index))
-    if not box or not box["w"] or not box["h"]:
+    c = chunkmeta.get(article_id, tile_index, chunk_index, LAYOUT)
+    if c is None or not c.has_box:
         return None
     pw, ph = page_size(article_id, tile_index)
     return {
-        "left": 100 * box["x"] / pw, "top": 100 * box["y"] / ph,
-        "width": 100 * box["w"] / pw, "height": 100 * box["h"] / ph,
+        "left": 100 * c.x / pw, "top": 100 * c.y / ph,
+        "width": 100 * c.width / pw, "height": 100 * c.height / ph,
     }
 
 
@@ -684,12 +667,12 @@ def _do_tile(article_id: int, tile_index: int, chunk_index: int) -> tuple[dict, 
     {"ok": True, "label": str, "image": bytes, "mime": str}; each backend
     formats that into its own tool-result shape.
     """
-    boxes = _chunk_boxes(article_id)
-    if (tile_index, chunk_index) not in boxes:
+    chunks = chunkmeta.for_article(article_id, LAYOUT)
+    if (tile_index, chunk_index) not in chunks:
         # Report in the same 1-based page numbering the tool accepts, so the
         # correction the model makes is directly usable.
-        pages = sorted({t + 1 for t, _ in boxes})
-        here = sorted(c for t, c in boxes if t == tile_index)
+        pages = sorted({t + 1 for t, _ in chunks})
+        here = sorted(c for t, c in chunks if t == tile_index)
         msg = (f"No such region. Article {article_id} has pages {pages}; "
                + (f"page {tile_index + 1} has regions {here}."
                   if here else f"page {tile_index + 1} does not exist."))
@@ -865,6 +848,11 @@ def _lexical_fn():
         return None
 
 
+def _scale_of(article_id: int, tile_index: int, chunk_index: int) -> str:
+    """retrieve.py's ScaleFn, bound to this process's index."""
+    return chunkmeta.scale_of(article_id, tile_index, chunk_index, LAYOUT)
+
+
 def _oneshot_pages(question: str, emit, provider: str,
                    n_pages: int = ONESHOT_PAGES) -> list[dict]:
     """Hybrid search → best whole pages (retrieve, fuse, read pages).
@@ -884,7 +872,7 @@ def _oneshot_pages(question: str, emit, provider: str,
     import retrieve
 
     pages_ranked, debug = retrieve.retrieve_pages(
-        search, question, str(TILES_DIR), n_pages=n_pages,
+        search, question, _scale_of, n_pages=n_pages,
         per_query=_per_query(n_pages), lexical_fn=_lexical_fn())
 
     # `score` is only comparable within one retriever: visual scores are cosines

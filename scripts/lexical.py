@@ -26,8 +26,10 @@ from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
-INDEX_DIR = Path("index")
-TEXT_SIDECAR = INDEX_DIR / "text.json"
+import layout
+
+INDEX_DIR = layout.DEFAULT.index_dir
+TEXT_SIDECAR = layout.DEFAULT.text_sidecar
 
 # Query words that carry intent, not content. "Pokaż próg uszczelniający" must
 # match on "próg uszczelniający"; leaving "pokaż"/"jaka"/"jest" in dilutes every

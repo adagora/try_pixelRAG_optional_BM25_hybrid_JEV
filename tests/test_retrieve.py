@@ -40,9 +40,9 @@ def test_query_variants_single_when_no_scaffolding():
 
 # -- aggregation ------------------------------------------------------------
 
-def test_aggregate_groups_chunks_by_page(tiles_dir, hits):
+def test_aggregate_groups_chunks_by_page(scale_of, hits):
     out = retrieve.aggregate(hits((0, 0, 1, 0.5), (0, 0, 2, 0.4), (0, 1, 1, 0.45)),
-                             tiles_dir)
+                             scale_of)
     assert len(out) == 2
     top = out[0]
     assert (top["article_id"], top["tile_index"]) == (0, 0)
@@ -50,35 +50,35 @@ def test_aggregate_groups_chunks_by_page(tiles_dir, hits):
     assert top["page"] == 1                      # 1-based for display
 
 
-def test_aggregate_agreement_bonus_is_applied(tiles_dir, hits):
+def test_aggregate_agreement_bonus_is_applied(scale_of, hits):
     """best + AGREEMENT * sum(rest) — the whole reason pages beat chunks."""
-    out = retrieve.aggregate(hits((0, 0, 1, 0.5), (0, 0, 2, 0.4)), tiles_dir)
+    out = retrieve.aggregate(hits((0, 0, 1, 0.5), (0, 0, 2, 0.4)), scale_of)
     assert out[0]["score"] == pytest.approx(0.5 + retrieve.AGREEMENT * 0.4)
 
 
-def test_aggregate_one_clean_hit_beats_several_mediocre(tiles_dir, hits):
+def test_aggregate_one_clean_hit_beats_several_mediocre(scale_of, hits):
     """The stated design constraint: agreement is evidence, not a majority vote."""
     out = retrieve.aggregate(
         hits((0, 0, 1, 0.90),
              (0, 1, 1, 0.50), (0, 1, 2, 0.50)),
-        tiles_dir)
+        scale_of)
     assert out[0]["tile_index"] == 0
 
 
-def test_aggregate_focus_is_a_region_never_the_gist(tiles_dir, hits):
+def test_aggregate_focus_is_a_region_never_the_gist(scale_of, hits):
     """A gist box spans the page, so highlighting it would mean nothing."""
-    out = retrieve.aggregate(hits((0, 0, 0, 0.9), (0, 0, 2, 0.4)), tiles_dir)
+    out = retrieve.aggregate(hits((0, 0, 0, 0.9), (0, 0, 2, 0.4)), scale_of)
     assert out[0]["focus"] == 2
 
 
-def test_aggregate_focus_none_when_only_gist_matched(tiles_dir, hits):
-    out = retrieve.aggregate(hits((0, 0, 0, 0.9)), tiles_dir)
+def test_aggregate_focus_none_when_only_gist_matched(scale_of, hits):
+    out = retrieve.aggregate(hits((0, 0, 0, 0.9)), scale_of)
     assert out[0]["focus"] is None
 
 
-def test_aggregate_missing_manifest_degrades_to_region(tmp_path, hits):
+def test_aggregate_missing_manifest_degrades_to_region(hits):
     """An index built before `scale` was recorded must still rank."""
-    out = retrieve.aggregate(hits((0, 0, 1, 0.5)), str(tmp_path / "nope"))
+    out = retrieve.aggregate(hits((0, 0, 1, 0.5)), lambda a, t, c: "region")
     assert out[0]["n_chunks"] == 1
 
 
@@ -168,7 +168,7 @@ def test_rrf_weight_shifts_the_lexical_vote():
 
 # -- the whole pipeline, with retrievers injected ---------------------------
 
-def test_retrieve_pages_visual_only(tiles_dir, hits):
+def test_retrieve_pages_visual_only(scale_of, hits):
     calls = []
 
     def fake_search(q, n):
@@ -176,31 +176,31 @@ def test_retrieve_pages_visual_only(tiles_dir, hits):
         return hits((0, 0, 1, 0.9), (0, 1, 1, 0.4))
 
     pages, debug = retrieve.retrieve_pages(
-        fake_search, "Ile kosztuje dzielony wał?", tiles_dir, n_pages=2)
+        fake_search, "Ile kosztuje dzielony wał?", scale_of, n_pages=2)
     assert len(calls) == 2                       # question + noun phrase
     assert [p["page"] for p in pages] == [1, 2]
     assert [d["retriever"] for d in debug] == ["visual", "visual"]
 
 
-def test_retrieve_pages_respects_n_pages(tiles_dir, hits):
+def test_retrieve_pages_respects_n_pages(scale_of, hits):
     pages, _ = retrieve.retrieve_pages(
         lambda q, n: hits((0, 0, 1, 0.9), (0, 1, 1, 0.4)),
-        "dzielony wał", tiles_dir, n_pages=1)
+        "dzielony wał", scale_of, n_pages=1)
     assert len(pages) == 1
 
 
-def test_retrieve_pages_hybrid_fuses_the_text_layer(tiles_dir, hits):
+def test_retrieve_pages_hybrid_fuses_the_text_layer(scale_of, hits):
     def fake_lex(q, n):
         return [{"article_id": 0, "page": 2, "score": 8.0}]
 
     pages, debug = retrieve.retrieve_pages(
-        lambda q, n: hits((0, 0, 1, 0.9)), "dzielony wał", tiles_dir,
+        lambda q, n: hits((0, 0, 1, 0.9)), "dzielony wał", scale_of,
         n_pages=2, lexical_fn=fake_lex)
     assert {p["page"] for p in pages} == {1, 2}
     assert debug[-1]["retriever"] == "lexical"
 
 
-def test_retrieve_pages_variant_results_stay_in_variant_order(tiles_dir, hits):
+def test_retrieve_pages_variant_results_stay_in_variant_order(scale_of, hits):
     """The two phrasings are searched concurrently, but fuse() reads variant 0
     as the question as asked. Results must be re-paired with their own query,
     not with whichever thread finished first."""
@@ -208,7 +208,7 @@ def test_retrieve_pages_variant_results_stay_in_variant_order(tiles_dir, hits):
                  "dzielony wał": hits((0, 1, 1, 0.5))}
 
     _, debug = retrieve.retrieve_pages(
-        lambda q, n: per_query[q], "Ile kosztuje dzielony wał?", tiles_dir)
+        lambda q, n: per_query[q], "Ile kosztuje dzielony wał?", scale_of)
     assert [d["query"] for d in debug] == ["Ile kosztuje dzielony wał?",
                                            "dzielony wał"]
     assert debug[0]["top"][0]["page"] == 1       # what variant 0 actually found

@@ -20,23 +20,26 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import rag
 import requests
 import yaml
+
+import layout
+import rag
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--k", type=int, default=5, help="recall@k cutoff")
     ap.add_argument("--port", type=int, default=30001)
-    ap.add_argument("--questions", default="eval/questions.yaml")
+    ap.add_argument("--questions",
+                    default=str(layout.ROOT / "eval" / "questions.yaml"))
     args = ap.parse_args()
 
     api = f"http://127.0.0.1:{args.port}"
     questions = yaml.safe_load(Path(args.questions).read_text())
 
     # articles.json is a list; a document's article_id is its position in it.
-    articles = json.loads(Path("index/articles.json").read_text())
+    articles = json.loads(layout.DEFAULT.articles_json.read_text(encoding="utf-8"))
     stem_of = {i: a["title"] for i, a in enumerate(articles)}
 
     try:

@@ -29,13 +29,19 @@ all on top of unmodified PixelRAG search:
    question about one row and wants a region. Detecting that from the question is
    guesswork, so instead both are kept and the gist gets a small bonus — enough
    to break ties toward the page that is topically about the subject.
+
+This module does no IO and imports nothing that does. `search_fn`, `lexical_fn`
+and `scale_of` are all injected, so the ranking policy — the part the README
+quotes recall figures against — can be exercised with three plain functions.
 """
 
 from __future__ import annotations
 
-import json
 import re
-from functools import lru_cache
+from typing import Callable
+
+# (article_id, tile_index, chunk_index) -> "page" | "region". See chunkmeta.
+ScaleFn = Callable[[int, int, int], str]
 
 # Fraction of each additional matching chunk's score added to a page's total.
 # Low on purpose: agreement is evidence, but four half-matches must not outrank
@@ -95,40 +101,20 @@ def query_variants(q: str) -> list[str]:
     return out
 
 
-@lru_cache(maxsize=None)
-def _scales(tiles_dir: str, article_id: int) -> dict[tuple[int, int], str]:
-    """(tile_index, chunk_index) -> 'page' | 'region'.
-
-    Falls back to treating chunk_index 0 as the gist, which is the convention
-    chunk_multiscale.py writes, so an index built before `scale` was recorded
-    still ranks correctly.
-    """
-    from pathlib import Path
-
-    m = Path(tiles_dir) / f"{article_id}.png.tiles" / "chunks.json"
-    if not m.exists():
-        return {}
-    try:
-        chunks = json.loads(m.read_text(encoding="utf-8")).get("chunks", [])
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return {
-        (c.get("tile_index", 0), c.get("chunk_index", 0)):
-            c.get("scale", "page" if c.get("chunk_index", 0) == 0 else "region")
-        for c in chunks
-    }
-
-
-def aggregate(hits: list[dict], tiles_dir: str) -> list[dict]:
+def aggregate(hits: list[dict], scale_of: ScaleFn) -> list[dict]:
     """Chunk hits -> page-scored candidates, best first.
 
     Each candidate keeps the chunks that put it there, so the caller can show
     *where* on the page the match was and can pick a region crop to highlight.
+
+    `scale_of` reports whether a chunk is the whole-page gist or one region.
+    Injected rather than read off disk: this module is the ranking policy and
+    the manifest that answers the question belongs to the index — see chunkmeta.
     """
     pages: dict[tuple[int, int], dict] = {}
     for h in hits:
         aid, ti = h["article_id"], h["tile_index"]
-        scale = _scales(tiles_dir, aid).get((ti, h["chunk_index"]), "region")
+        scale = scale_of(aid, ti, h["chunk_index"])
         s = h["score"] * (GIST_BONUS if scale == "page" else 1.0)
         p = pages.setdefault((aid, ti), {
             "article_id": aid, "tile_index": ti, "page": ti + 1,
@@ -267,7 +253,7 @@ def _lexical_as_pages(hits: list[dict]) -> list[dict]:
     } for h in hits]
 
 
-def retrieve_pages(search_fn, question: str, tiles_dir: str,
+def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
                    n_pages: int = 4, per_query: int = 24,
                    lexical_fn=None, lex_weight: float = LEX_WEIGHT,
                    fuse_depth: int = FUSE_DEPTH) -> tuple[list[dict], list[dict]]:
@@ -275,6 +261,9 @@ def retrieve_pages(search_fn, question: str, tiles_dir: str,
 
     `search_fn(query, n_results)` is injected rather than imported so this stays
     testable and so rag.py keeps sole ownership of the encoder/sidecar path.
+
+    `scale_of(article_id, tile_index, chunk_index)` reports gist versus region;
+    chunkmeta.scale_of is the production one.
 
     `lexical_fn(query, n)` is optional and turns this hybrid. Passing it in the
     same way keeps the text layer a caller's choice, not a hard dependency: a
@@ -301,7 +290,7 @@ def retrieve_pages(search_fn, question: str, tiles_dir: str,
 
     rankings, debug = [], []
     for v, hits in zip(variants, hit_lists):
-        ranked = aggregate(hits, tiles_dir)
+        ranked = aggregate(hits, scale_of)
         rankings.append(ranked)
         debug.append({
             "query": v, "retriever": "visual",

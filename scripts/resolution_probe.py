@@ -26,11 +26,14 @@ from PIL import Image
 from pixelrag_embed.embed_cpu import _clamp_width, _MAX_CHUNK_WIDTH
 from pixelrag_render.backends.pdf import render_pdf
 
-OUT = Path("index/_probe")
+import layout
+
+OUT = layout.DEFAULT.index_dir / "_probe"
 
 
 def main():
-    pdf = sys.argv[1] if len(sys.argv) > 1 else "pdfs/_TEST_SG2400_manual.pdf"
+    pdf = (sys.argv[1] if len(sys.argv) > 1
+           else str(layout.ROOT / "pdfs" / "_TEST_SG2400_manual.pdf"))
 
     if OUT.exists():
         shutil.rmtree(OUT)

@@ -52,6 +52,8 @@ import numpy as np
 import yaml
 from PIL import Image
 
+import layout
+
 # The model's native width. Wider crops get resized by the embedder anyway.
 CHUNK_WIDTH = 875
 # Row-strip height. Matches stock CHUNK_HEIGHT so crops stay in distribution.
@@ -209,9 +211,11 @@ def main() -> None:
     global EMIT_GIST
     EMIT_GIST = args.gist
 
-    cfg = yaml.safe_load(Path("pixelrag.yaml").read_text())
+    cfg = yaml.safe_load((layout.ROOT / "pixelrag.yaml").read_text())
     src = Path(cfg["source"]["path"]).expanduser()
-    tiles_root = Path(cfg.get("output", "./index")) / "tiles"
+    # Same index tree `pixelrag index` writes — see prepare_hires.main.
+    index = layout.IndexLayout(layout._anchored(cfg.get("output", "./index"),
+                                                layout.ROOT / "index"))
 
     # Must mirror PDFSource.glob exactly — the tile directory name is the
     # document's position in this list.
@@ -221,7 +225,7 @@ def main() -> None:
 
     total_chunks = total_pages = total_skipped = 0
     for idx, pdf in enumerate(pdfs):
-        tile_dir = tiles_root / f"{idx}.png.tiles"
+        tile_dir = index.tile_dir(idx)
         if not tile_dir.exists():
             print(f"  [{idx}] {pdf.name} — no tiles, run prepare_hires.py first")
             continue

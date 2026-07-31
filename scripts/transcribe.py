@@ -73,9 +73,11 @@ import time
 from pathlib import Path
 
 import imagefit
+import layout
 import rag
 
-OUT = Path(os.environ.get("PIXELRAG_TRANSCRIPTS", "index/transcripts"))
+OUT = layout._anchored(os.environ.get("PIXELRAG_TRANSCRIPTS", ""),
+                       layout.DEFAULT.transcripts_dir)
 MANIFEST = OUT / "manifest.json"
 
 # Deliberately not the reader's system prompt. The reader's job is to answer;
@@ -142,10 +144,9 @@ def load(article_id: int, tile_index: int) -> str | None:
 
 def _pages() -> list[tuple[int, int, Path]]:
     out = []
-    for d in sorted(rag.TILES_DIR.glob("*.png.tiles")):
-        try:
-            aid = int(d.name.split(".")[0])
-        except ValueError:
+    for d in rag.LAYOUT.tile_dirs():
+        aid = layout._article_id_of(d)
+        if aid < 0:
             continue
         for f in sorted(d.glob("tile_*.jpg")):
             out.append((aid, int(f.stem.split("_")[1]), f))

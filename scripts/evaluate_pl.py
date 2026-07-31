@@ -84,7 +84,7 @@ def _baseline(question: str, k: int, depth: int | None = None) -> list[tuple[int
 
 def _improved(question: str, k: int) -> list[tuple[int, int]]:
     ranked, _ = retrieve.retrieve_pages(
-        rag.search, question, str(rag.TILES_DIR), n_pages=k,
+        rag.search, question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k))
     return [(p["article_id"], p["page"]) for p in ranked]
 
@@ -121,7 +121,7 @@ def _hybrid(question: str, k: int, w: float = retrieve.LEX_WEIGHT
     import lexical
 
     ranked, _ = retrieve.retrieve_pages(
-        rag.search, question, str(rag.TILES_DIR), n_pages=k,
+        rag.search, question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k),
         lexical_fn=lexical.search_text, lex_weight=w)
     return [(p["article_id"], p["page"]) for p in ranked]

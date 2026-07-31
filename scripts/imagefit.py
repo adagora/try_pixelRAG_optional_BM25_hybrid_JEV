@@ -49,6 +49,8 @@ import math
 import os
 from pathlib import Path
 
+import layout
+
 # Gemini's tile size. Images are diced into this grid and every tile costs the
 # same 258 tokens whether it is full of table or full of margin.
 GEMINI_TILE = 768
@@ -76,7 +78,10 @@ GEMINI_TILE_CHASING = os.environ.get("PIXELRAG_GEMINI_TILE_CHASING", "0") != "0"
 # Set to 0 to send pages exactly as rendered, e.g. to A/B the accuracy cost.
 ENABLED = os.environ.get("PIXELRAG_IMAGE_FIT", "1") != "0"
 
-CACHE_DIR = Path(os.environ.get("PIXELRAG_FIT_CACHE", "index/tiles/_fit"))
+# Derived bytes, safe to delete, so they live under the index they were made
+# from. Anchored to the repo root — see layout.py.
+CACHE_DIR = layout._anchored(os.environ.get("PIXELRAG_FIT_CACHE", ""),
+                             layout.DEFAULT.fit_cache)
 
 
 # --------------------------------------------------------------------------
@@ -226,23 +231,22 @@ def _size_of(path: Path) -> tuple[int, int]:
 # --------------------------------------------------------------------------
 
 def _report() -> None:
-    import glob
-
-    pages = sorted(glob.glob("index/tiles/*.tiles/tile_*.jpg"))
+    index = layout.DEFAULT
+    pages = [p for d in index.tile_dirs() for p in sorted(d.glob("tile_*.jpg"))]
     if not pages:
-        print("No rendered pages under index/tiles/. Build the index first.")
+        print(f"No rendered pages under {index.tiles_dir}. Build the index first.")
         return
 
     rows = []
     for p in pages:
-        w, h = _size_of(Path(p))
+        w, h = _size_of(p)
         gw, gh = _gemini_target(w, h)
         aw, ah = _anthropic_target(w, h)
         rows.append((
             gemini_tokens(w, h), gemini_tokens(gw, gh),
             # before: what a high-res-tier model bills at full resolution
             anthropic_tokens(w, h, 2576), anthropic_tokens(aw, ah),
-            os.path.getsize(p),
+            p.stat().st_size,
         ))
 
     n = len(rows)
@@ -250,7 +254,7 @@ def _report() -> None:
     ga = sum(r[1] for r in rows) / n
     ab = sum(r[2] for r in rows) / n
     aa = sum(r[3] for r in rows) / n
-    w0, h0 = _size_of(Path(pages[0]))
+    w0, h0 = _size_of(pages[0])
 
     print(f"{n} pages, {w0}x{h0} source\n")
     print(f"gemini    {gb:8.0f} -> {ga:8.0f} tokens/page  ({100*(1-ga/gb):.0f}% off)")
