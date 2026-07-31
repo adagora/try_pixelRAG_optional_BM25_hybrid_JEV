@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -55,6 +56,8 @@ from pathlib import Path
 import numpy as np
 
 import layout
+
+log = logging.getLogger("pixelrag.answer_cache")
 
 ENABLED = os.environ.get("PIXELRAG_ANSWER_CACHE", "1") != "0"
 THRESHOLD = float(os.environ.get("PIXELRAG_CACHE_THRESHOLD", "0.95"))
@@ -112,12 +115,21 @@ class AnswerCache:
         try:
             meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
             vecs = np.load(self.vec_path)["v"].astype(np.float32)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return                      # no cache yet, which is the normal case
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+            log.warning("answer cache at %s is unreadable (%s) — starting "
+                        "empty; delete both files to silence this",
+                        self.meta_path.parent, e)
             return
         # A half-written pair is worse than none: drop both rather than pair a
         # question with someone else's vector.
         if isinstance(meta, list) and len(meta) == len(vecs):
             self._meta, self._vecs = meta, vecs
+        else:
+            log.warning("answer cache is inconsistent (%d entries, %d vectors)"
+                        " — discarding it rather than pairing a question with "
+                        "another question's vector", len(meta), len(vecs))
 
     def _save(self) -> None:
         try:
@@ -131,8 +143,10 @@ class AnswerCache:
             np.savez_compressed(self.vec_path, v=self._vecs)
             self.meta_path.write_text(
                 json.dumps(self._meta, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as e:
+            log.warning("could not persist the answer cache to %s (%s) — it "
+                        "will still work in memory for this process",
+                        self.meta_path.parent, e)
 
     # -- api ---------------------------------------------------------------
 
@@ -192,6 +206,10 @@ class AnswerCache:
                 # A different embedding model was configured. Its vectors are
                 # not comparable to these, and silently mixing spaces would
                 # make every similarity meaningless.
+                log.warning("embedding width changed (%d -> %d): the answer "
+                            "cache has been reset, since vectors from two "
+                            "models cannot be compared",
+                            self._vecs.shape[1], q.shape[1])
                 self._vecs, self._meta = q, []
             else:
                 self._vecs = np.vstack([self._vecs, q])

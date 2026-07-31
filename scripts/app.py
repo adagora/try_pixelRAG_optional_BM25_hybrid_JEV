@@ -242,8 +242,9 @@ def ask(req: Ask):
 
 
 if __name__ == "__main__":
+    rag.configure_logging()
     if not rag.INDEX_DIR.exists():
-        sys.exit("No ./index — build it first (see README).")
+        sys.exit(f"No index at {rag.INDEX_DIR} — build it first (see README).")
     # The query encoder lives here rather than in the faiss process (see rag.py).
     # Load it now, in the background, so the first question doesn't pay for it.
     if rag.LOCAL_ENCODE:

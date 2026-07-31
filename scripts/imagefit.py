@@ -45,12 +45,15 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import layout
+
+log = logging.getLogger("pixelrag.imagefit")
 
 # Gemini's tile size. Images are diced into this grid and every tile costs the
 # same 258 tokens whether it is full of table or full of margin.
@@ -244,6 +247,11 @@ def fit(path: Path, policy: Policy) -> tuple[bytes, str]:
             im.save(buf, format="JPEG", quality=QUALITY, optimize=True)
             data = buf.getvalue()
     except Exception:
+        # A page that reaches the reader too large is a cost bug; one that does
+        # not reach it at all is a broken answer. Take the cost bug, and say so
+        # — silently paying full high-res rates is the failure nobody notices.
+        log.warning("could not resize %s; sending it at full resolution",
+                    path.name, exc_info=True)
         return path.read_bytes(), "image/jpeg"
 
     # When nothing was resized, re-encoding can come out larger than a source
@@ -257,8 +265,10 @@ def fit(path: Path, policy: Policy) -> tuple[bytes, str]:
     try:
         cached.parent.mkdir(parents=True, exist_ok=True)
         cached.write_bytes(data)
-    except OSError:
-        pass
+    except OSError as e:
+        # Only a lost optimisation, but a fit cache that never writes means
+        # paying the resize on every page of every query.
+        log.debug("could not cache resized page at %s (%s)", cached, e)
     return data, "image/jpeg"
 
 

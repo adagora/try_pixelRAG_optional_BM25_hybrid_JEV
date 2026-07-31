@@ -15,6 +15,7 @@ Shared by ask.py (CLI) and app.py (web UI) so prompt and policy cannot drift.
 
 import base64
 import json
+import logging
 import os
 import re
 from functools import lru_cache
@@ -29,6 +30,33 @@ import imagefit
 import layout
 import pagehit
 import providers
+
+# This system degrades rather than fails, in six separate places: the encoder
+# sidecar, local encoding, the answer cache, the text sidecar, citation
+# geometry, and page resizing. Each fallback is correct — a slower answer beats
+# no answer — but a silent one means nobody can tell which of them is active,
+# and one of them (server-side encoding) is a 7x latency regression that looks
+# exactly like a fast path from outside. Everything below logs on the way down.
+log = logging.getLogger("pixelrag")
+
+
+def configure_logging(level: str | None = None, stream=None) -> None:
+    """Send pixelrag's warnings somewhere a human will see them.
+
+    Called by the entry points (ask.py, app.py), not at import: a library that
+    installs a root handler on import steals logging from whatever embeds it.
+    PIXELRAG_LOG=debug turns up the detail; PIXELRAG_LOG=critical quiets it.
+    """
+    name = (level or os.environ.get("PIXELRAG_LOG", "warning")).strip().upper()
+    root = logging.getLogger("pixelrag")
+    root.setLevel(getattr(logging, name, logging.WARNING))
+    if not root.handlers:
+        h = logging.StreamHandler(stream)
+        h.setFormatter(logging.Formatter("pixelrag: %(levelname)s: %(message)s"))
+        root.addHandler(h)
+    # Warnings are diagnostics about how the answer was produced; they must not
+    # interleave with an answer being streamed to stdout.
+    root.propagate = False
 
 # One connection pool for the process. A search makes at least two HTTP calls
 # (encode, then /search) and each used to open, use and discard its own socket:
@@ -422,8 +450,11 @@ def _sidecar_available() -> bool:
         try:
             r = _HTTP.get(f"{ENCODER_URL}/health", timeout=2)
             _sidecar_ok = r.ok and r.json().get("status") == "ok"
-        except requests.RequestException:
+        except requests.RequestException as e:
             _sidecar_ok = False
+            log.info("encoder sidecar not reachable at %s (%s) — loading the "
+                     "model in-process instead; first query pays ~30s",
+                     ENCODER_URL, e)
     return _sidecar_ok
 
 
@@ -541,7 +572,9 @@ def warm_encoder() -> None:
         try:
             embed_query("warmup")
         except Exception:
-            pass  # fall back to server-side encoding at query time
+            log.warning("query encoder failed to warm up — queries will be "
+                        "encoded server-side, which is ~7x slower "
+                        "(p95 1673ms against 450ms)", exc_info=True)
 
 
 def search(query: str, n_results: int = 5, timeout: int = 120) -> list[dict]:
@@ -563,7 +596,11 @@ def search(query: str, n_results: int = 5, timeout: int = 120) -> list[dict]:
         try:
             q = {"embedding": embed_query(query)}
         except Exception:
-            q = {"text": query}          # any local failure -> server encodes
+            # The server encodes on one OpenMP thread — p95 1673ms against
+            # 450ms here. Correct, and slow enough to be worth saying so.
+            log.warning("local encode failed; falling back to server-side "
+                        "encoding for this query", exc_info=True)
+            q = {"text": query}
     else:
         q = {"text": query}
     r = _HTTP.post(f"{SEARCH_API}/search",
@@ -739,7 +776,11 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
         try:
             key = embed_query(question.strip())
         except Exception:
-            key = None          # encoder down — answer the slow way, don't fail
+            # Encoder down: answer the slow way rather than fail, but the
+            # answer cache is off for this question and nothing else says so.
+            log.warning("could not embed the question — answer cache disabled "
+                        "for this query", exc_info=True)
+            key = None
         if key is not None:
             hit = answer_cache.default().get(key, ns)
             if hit is not None:
@@ -754,7 +795,9 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
         try:
             answer_cache.default().put(key, question.strip(), ns, result)
         except Exception:
-            pass                # a cache write must not fail a good answer
+            # A cache write must not fail a good answer — but a cache that
+            # never writes is a cache that never hits, which looks like nothing.
+            log.warning("answer cache write failed", exc_info=True)
     return result
 
 
@@ -818,9 +861,14 @@ def _lexical_fn():
         import lexical
 
         if not lexical.TEXT_SIDECAR.exists():
+            log.warning("PIXELRAG_HYBRID=1 but %s is missing — answering "
+                        "visual-only; run scripts/build_text_index.py",
+                        lexical.TEXT_SIDECAR)
             return None
         return lexical.search_text
     except ImportError:
+        log.warning("PIXELRAG_HYBRID=1 but the lexical module could not be "
+                    "imported — answering visual-only", exc_info=True)
         return None
 
 
@@ -1093,7 +1141,10 @@ def _done(answer: str, trace: list[dict], usage: providers.Usage, steps: int,
     try:
         cites = resolve_citations(body, raw_cites, pages_seen)
     except Exception:
-        cites = []   # highlighting is a nicety; never fail the answer over it
+        # Highlighting is a nicety; never fail the answer over it. It is still
+        # the reader's own evidence, so losing it is worth a line.
+        log.warning("could not resolve citations for this answer", exc_info=True)
+        cites = []
 
     # Legacy number pins, kept so the agent mode (which has no citation block)
     # still marks the figures it quoted.
@@ -1105,7 +1156,8 @@ def _done(answer: str, trace: list[dict], usage: providers.Usage, steps: int,
                 for hit in locate_values(aid, page, body):
                     pins.append({"article_id": aid, "page": page, **hit})
             except Exception:
-                pass
+                log.debug("number pinning failed for article %s page %s",
+                          aid, page, exc_info=True)
 
     return {"answer": body, "trace": trace, "usage": usage_out, "steps": steps,
             "provider": provider, "model": model, "pins": pins,

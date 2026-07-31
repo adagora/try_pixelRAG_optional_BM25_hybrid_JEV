@@ -36,7 +36,12 @@ def main():
                     help="default: whichever API key is set")
     ap.add_argument("--list-models", action="store_true",
                     help="list models the configured key can reach, then exit")
+    ap.add_argument("--log", metavar="LEVEL",
+                    help="debug|info|warning|error (or set PIXELRAG_LOG)")
     args = ap.parse_args()
+    # To stderr, alongside the trace: stdout carries the answer, and a warning
+    # in the middle of a streamed price is worse than no warning.
+    rag.configure_logging(args.log, stream=sys.stderr)
 
     if args.list_models:
         provider = args.provider or rag.detect_provider()
