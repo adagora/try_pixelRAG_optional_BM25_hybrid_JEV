@@ -14,7 +14,6 @@ the Anthropic key server-side and has to reach the search API on localhost.
     .venv/bin/python scripts/app.py        # http://127.0.0.1:8000
 """
 
-import io
 import json
 import queue
 import sys
@@ -22,13 +21,15 @@ import threading
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-import rag
 import requests
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import rag
+import snip
 
 HERE = Path(__file__).parent
 app = FastAPI(title="PixelRAG manuals")
@@ -83,80 +84,26 @@ def citation_snip(
 ):
     """Crop of the rendered page around citation rectangles, for chat inline.
 
-    Rects are the same percent-of-page boxes `citations.py` / the PDF viewer use.
-    When `rects` is empty or missing, returns a mid-height strip of the page so
-    the chat still has *something* visual for an unverified citation.
+    Rects are the same percent-of-page boxes `citations.py` and the PDF viewer
+    use. What the crop actually shows — padding, minimum size, the fallback band
+    for an unverified citation — is snip.py's business, not this route's.
     """
-    from PIL import Image, ImageDraw
-
     src = rag.page_path(article_id, page - 1)
     if not src.exists():
         return JSONResponse({"error": "no such page"}, status_code=404)
 
-    boxes: list[dict] = []
+    boxes = []
     if rects:
         try:
-            raw = json.loads(unquote(rects))
-            if isinstance(raw, list):
-                boxes = [b for b in raw if isinstance(b, dict)]
+            boxes = snip.parse_boxes(json.loads(unquote(rects)))
         except json.JSONDecodeError:
             return JSONResponse({"error": "bad rects json"}, status_code=400)
 
-    with Image.open(src) as im:
-        im = im.convert("RGB")
-        pw, ph = im.size
-        if boxes:
-            left = min(float(b.get("left", 0)) for b in boxes)
-            top = min(float(b.get("top", 0)) for b in boxes)
-            right = max(float(b.get("left", 0)) + float(b.get("width", 0)) for b in boxes)
-            bottom = max(float(b.get("top", 0)) + float(b.get("height", 0)) for b in boxes)
-        else:
-            # Unverified / no text layer: a readable band, not the whole page.
-            left, right = 4.0, 96.0
-            top, bottom = 28.0, 72.0
-
-        left = max(0.0, left - pad)
-        top = max(0.0, top - pad)
-        right = min(100.0, right + pad)
-        bottom = min(100.0, bottom + pad)
-        # Thin quote lines need air so the row label stays in frame.
-        # Large retrieval regions already fill the crop — leave them alone.
-        if boxes and (bottom - top) < 8.0:
-            mid = (top + bottom) / 2
-            top, bottom = max(0.0, mid - 5.0), min(100.0, mid + 5.0)
-        if boxes and (right - left) < 20.0:
-            mid = (left + right) / 2
-            left, right = max(0.0, mid - 12.0), min(100.0, mid + 12.0)
-
-        x0, y0 = int(pw * left / 100), int(ph * top / 100)
-        x1, y1 = int(pw * right / 100 + 0.999), int(ph * bottom / 100 + 0.999)
-        x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)
-        crop = im.crop((x0, y0, x1, y1)).convert("RGBA")
-
-        # Highlighter wash + border so the matched span/region is obvious.
-        if boxes:
-            overlay = Image.new("RGBA", crop.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-            for b in boxes:
-                bl = float(b.get("left", 0))
-                bt = float(b.get("top", 0))
-                bw = float(b.get("width", 0))
-                bh = float(b.get("height", 0))
-                rx0 = int(pw * bl / 100) - x0
-                ry0 = int(ph * bt / 100) - y0
-                rx1 = int(pw * (bl + bw) / 100) - x0
-                ry1 = int(ph * (bt + bh) / 100) - y0
-                draw.rectangle([rx0, ry0, rx1, ry1], fill=(255, 210, 63, 100))
-                draw.rectangle([rx0, ry0, rx1, ry1], outline=(180, 83, 31, 220), width=3)
-            crop = Image.alpha_composite(crop, overlay)
-
-        buf = io.BytesIO()
-        crop.convert("RGB").save(buf, format="JPEG", quality=88, optimize=True)
-        return Response(
-            buf.getvalue(),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "private, max-age=3600"},
-        )
+    return Response(
+        snip.render(src, boxes, pad=pad),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.get("/api/pdf/{article_id}")
@@ -192,9 +139,14 @@ def source_pdf(article_id: int):
 
 @app.get("/api/tile/{article_id}/{tile_index}/{chunk_index}")
 def tile_image(article_id: int, tile_index: int, chunk_index: int):
-    """Proxy a single region image, so the UI can show exactly what the agent saw."""
+    """Proxy a single region image, so the UI can show exactly what the agent saw.
+
+    Through rag's pooled session, not a bare requests.get: this fires once per
+    region the UI draws, which is precisely the traffic the connection pool was
+    introduced for — a handshake and a lingering TIME_WAIT per call otherwise.
+    """
     try:
-        r = requests.get(
+        r = rag._HTTP.get(
             f"{rag.SEARCH_API}/tile/{article_id}/{tile_index}/{chunk_index}", timeout=60)
         if not r.ok:
             return JSONResponse({"error": "tile fetch failed"}, status_code=502)
