@@ -1,0 +1,27 @@
+# PixelRAG index configuration.
+#
+# CAREFUL: load_config() does a shallow merge — {**DEFAULT_CONFIG, **yaml}.
+# Writing an `embed:` block replaces the whole default block, so every key you
+# need must be listed here. Unknown keys are silently ignored (upstream #98),
+# so a typo fails quietly rather than loudly.
+
+source:
+  type: pdf # PDFSource: globs **/*.pdf, sorted
+  path: ./pdfs
+
+embed:
+  model: Qwen/Qwen3-VL-Embedding-2B
+  # cuda → pixelrag_embed.embed (batched GPU). cpu/mps → embed_cpu (slow, 1-by-1).
+  device: cuda
+  # Required here: default GPU backend is sglang, which is not installed.
+  # direct_gpu uses transformers + CUDA (works with this .venv's torch+cu128).
+  backend: direct_gpu
+  gpu_ids: [0]
+
+index:
+  backend: faiss # nlist is auto-tuned: min(4096, n_vectors // 40)
+
+output: ./index
+# NOTE: PDF render DPI is NOT configurable here. pipelines.py calls
+# render_pdf(path, dir, stem=idx) with no ingest kwargs, so dpi=200 is
+# effectively hardcoded. `ingest:` settings only reach the web/CDP path.

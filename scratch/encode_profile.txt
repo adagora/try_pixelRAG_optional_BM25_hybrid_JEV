@@ -1,0 +1,38 @@
+         253978 function calls (232044 primitive calls) in 1.666 seconds
+
+   Ordered by: cumulative time
+   List reduced from 827 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        5    0.002    0.000    1.666    0.333 /Users/gora/AI_Project/try_pixelRAG/scripts/rag.py:383(embed_query)
+        5    0.794    0.159    0.794    0.159 {method 'cpu' of 'torch._C.TensorBase' objects}
+   2125/5    0.002    0.000    0.778    0.156 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1774(_wrapped_call_impl)
+   2125/5    0.003    0.000    0.778    0.156 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py:1782(_call_impl)
+        5    0.000    0.000    0.778    0.156 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/generic.py:905(wrapper)
+        5    0.000    0.000    0.778    0.156 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/models/qwen3_vl/modeling_qwen3_vl.py:1154(forward)
+        5    0.000    0.000    0.623    0.125 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/generic.py:978(wrapper)
+        5    0.000    0.000    0.623    0.125 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/output_capturing.py:231(wrapper)
+        5    0.254    0.051    0.622    0.124 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/models/qwen3_vl/modeling_qwen3_vl.py:761(forward)
+        5    0.000    0.000    0.256    0.051 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/masking_utils.py:871(create_causal_mask)
+        5    0.000    0.000    0.250    0.050 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/masking_utils.py:371(sdpa_mask)
+        5    0.249    0.050    0.250    0.050 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/masking_utils.py:235(_ignore_causal_mask_sdpa)
+        5    0.000    0.000    0.155    0.031 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/torch/nn/modules/sparse.py:188(forward)
+        5    0.000    0.000    0.155    0.031 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/torch/nn/functional.py:2503(embedding)
+        5    0.155    0.031    0.155    0.031 {built-in method torch.embedding}
+      140    0.000    0.000    0.087    0.001 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/modeling_layers.py:76(__call__)
+      140    0.002    0.000    0.086    0.001 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/models/qwen3_vl/modeling_qwen3_vl.py:540(forward)
+        5    0.000    0.000    0.062    0.012 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/processing_utils.py:1967(apply_chat_template)
+        1    0.000    0.000    0.061    0.061 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/chat_template_utils.py:384(_get_template_variables)
+      140    0.003    0.000    0.054    0.000 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/models/qwen3_vl/modeling_qwen3_vl.py:472(forward)
+   4772/2    0.003    0.000    0.033    0.017 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/jinja2/visitor.py:35(visit)
+        2    0.000    0.000    0.033    0.017 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/jinja2/compiler.py:829(visit_Template)
+        1    0.000    0.000    0.032    0.032 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/chat_template_utils.py:419(_compile_jinja_template)
+        1    0.000    0.000    0.032    0.032 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/utils/chat_template_utils.py:424(_cached_compile_jinja_template)
+        1    0.000    0.000    0.032    0.032 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/jinja2/environment.py:1092(from_string)
+        1    0.000    0.000    0.032    0.032 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/jinja2/environment.py:731(compile)
+      980    0.001    0.000    0.027    0.000 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/torch/nn/modules/linear.py:130(forward)
+      565    0.011    0.000    0.026    0.000 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/transformers/models/qwen3_vl/modeling_qwen3_vl.py:403(forward)
+      980    0.026    0.000    0.026    0.000 {built-in method torch._C._nn.linear}
+        2    0.000    0.000    0.026    0.013 /Users/gora/AI_Project/try_pixelRAG/.venv/lib/python3.12/site-packages/jinja2/environment.py:618(_parse)
+
+

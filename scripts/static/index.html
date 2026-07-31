@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wyszukiwanie w dokumentacji — PixelRAG</title>
+<style>
+  /* Design intent: the right half is ONE document — the real PDF, rendered by
+     pdf.js, open at the cited page with the quote highlighted on it. Not a
+     stack of page screenshots: someone checking a price wants the source open
+     in front of them, scrollable and selectable, with the exact line marked. */
+  :root {
+    color-scheme: light dark;
+    --bg:#fbfaf8; --panel:#fff; --ink:#1a1a1a; --muted:#6b6b6b; --line:#e3e1dd;
+    --accent:#b4531f; --soft:#b4531f22; --user:#efece7;
+    --hl:#ffd23f; --hlbd:#c69200;          /* quote highlight (highlighter pen) */
+    --num:#1f7a4d; --numbg:#1f7a4d24;      /* located figures */
+    --warn:#b8541c; --warnbg:#b8541c1f;
+    --r:10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15151a; --panel:#1d1d23; --ink:#e9e7e3; --muted:#9a978f;
+            --line:#32323b; --accent:#e08a4e; --soft:#e08a4e2b; --user:#25252d;
+            --hl:#ffcf33; --hlbd:#8f6a00; --num:#37d68a; --numbg:#37d68a2b;
+            --warn:#f0a06a; --warnbg:#f0a06a26; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); height:100vh;
+         display:flex; flex-direction:column;
+         font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:10px 18px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  .sub { font-size:12.5px; color:var(--muted); }
+  .tools { margin-left:auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .keybar { display:flex; align-items:center; gap:6px; }
+  .keybar input { width:min(240px,34vw); padding:6px 10px; border:1px solid var(--line);
+    border-radius:6px; background:var(--panel); color:var(--ink);
+    font:12.5px/1.4 ui-monospace,Menlo,monospace; }
+  .keybar input:focus { outline:2px solid var(--soft); border-color:var(--accent); }
+  .chk { display:flex; gap:5px; align-items:center; cursor:pointer; font-size:12.5px; color:var(--muted); }
+
+  #layout { flex:1; display:grid; grid-template-columns:minmax(0,0.78fr) minmax(0,1.22fr); min-height:0; }
+  @media (max-width:980px){ #layout{ grid-template-columns:1fr; grid-template-rows:1fr 1.15fr; } }
+
+  /* ---------------- chat ---------------- */
+  #chat { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
+  #log { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:16px; }
+  .msg { max-width:96%; }
+  .msg.user { align-self:flex-end; background:var(--user); padding:9px 13px; border-radius:var(--r); }
+  .msg.bot .body { font-size:14.5px; line-height:1.6; }
+  .msg.bot .body.meta { white-space:pre-wrap; }
+  .msg.bot .body > :first-child { margin-top:0; }
+  .msg.bot .body > :last-child { margin-bottom:0; }
+  .msg.bot .body p { margin:0 0 .7em; }
+  .msg.bot .body strong { font-weight:650; color:var(--ink); }
+  .msg.bot .body em { font-style:italic; color:var(--muted); }
+  .msg.bot .body ol, .msg.bot .body ul { margin:.35em 0 .85em; padding-left:1.35em; }
+  .msg.bot .body li { margin:.28em 0; padding-left:.15em; }
+  .msg.bot .body li > ul, .msg.bot .body li > ol { margin:.2em 0 .35em; }
+  .msg.bot .body li::marker { color:var(--accent); font-weight:600; }
+  .msg.bot .body code { font:500 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+    background:var(--user); padding:.1em .35em; border-radius:4px; }
+  .msg.bot .body > p:has(> em:only-child) { color:var(--muted); font-size:13.5px;
+    border-left:2px solid var(--line); padding-left:10px; }
+  .meta { font-size:12px; color:var(--muted); margin-top:8px; }
+  .trace { display:flex; flex-direction:column; gap:3px; margin:2px 0 10px; }
+  .step { display:flex; gap:8px; font-size:12.5px; color:var(--muted); }
+  .step .ic { width:14px; text-align:center; flex:none; color:var(--accent); font-weight:700; }
+  .step code { font:500 12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--ink); }
+  .step.viewed { cursor:pointer; }
+  .step.viewed:hover code { color:var(--accent); text-decoration:underline; }
+  .spin { display:inline-block; width:9px; height:9px; border:2px solid var(--soft);
+          border-top-color:var(--accent); border-radius:50%; animation:sp .7s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .err { color:#c0392b; }
+  @media (prefers-color-scheme: dark){ .err{ color:#ff8b7a; } }
+
+  /* Citation list under an answer — the clickable index into the document. */
+  .cites { margin-top:12px; border-top:1px solid var(--line); padding-top:10px;
+           display:flex; flex-direction:column; gap:6px; }
+  .cites h4 { margin:0 0 2px; font:600 12px/1.4 inherit; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.04em; }
+  .cite { display:flex; gap:8px; align-items:flex-start; padding:6px 8px;
+          border:1px solid var(--line); border-radius:8px; background:var(--panel);
+          cursor:pointer; font-size:13px; text-align:left; width:100%; color:inherit; }
+  .cite:hover { border-color:var(--accent); }
+  .cite[aria-current=true] { border-color:var(--accent); box-shadow:0 0 0 2px var(--soft); }
+  .cite .n { flex:none; width:19px; height:19px; border-radius:5px; background:var(--accent);
+             color:#fff; font:700 11px/19px ui-monospace,Menlo,monospace; text-align:center; }
+  .cite q { font-style:normal; }
+  .cite q::before, .cite q::after { content:'„'; color:var(--muted); }
+  .cite q::after { content:'”'; }
+  .cite .where { color:var(--muted); font-size:12px; }
+  .badge { font:700 10px/1.6 ui-monospace,Menlo,monospace; padding:0 5px; border-radius:4px;
+           border:1px solid var(--num); color:var(--num); background:var(--numbg); flex:none; }
+  .badge.no { border-color:var(--warn); color:var(--warn); background:var(--warnbg); }
+
+  form { display:flex; gap:8px; padding:13px 18px; border-top:1px solid var(--line); }
+  input[type=text] { flex:1; min-width:0; padding:10px 13px; border:1px solid var(--line);
+    border-radius:var(--r); background:var(--panel); color:var(--ink); font:inherit; }
+  input[type=text]:focus { outline:2px solid var(--soft); border-color:var(--accent); }
+  button.go { padding:10px 16px; border:0; border-radius:var(--r); background:var(--accent);
+    color:#fff; font:600 14px/1 inherit; cursor:pointer; }
+  button.go:disabled { opacity:.5; cursor:default; }
+
+  /* ---------------- pdf viewer ---------------- */
+  #viewer { display:flex; flex-direction:column; min-height:0; min-width:0; }
+  .vbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+          padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .vbar select { max-width:min(42ch,38vw); padding:4px 8px; border:1px solid var(--line);
+    border-radius:6px; background:var(--bg); color:var(--ink); font:600 12.5px/1.4 inherit; }
+  .vbar .grp { display:flex; align-items:center; gap:4px; }
+  .vbar button { padding:3px 9px; border:1px solid var(--line); background:var(--bg);
+    color:var(--ink); border-radius:6px; font:600 12px/1.5 inherit; cursor:pointer; }
+  .vbar button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .vbar button:disabled { opacity:.4; cursor:default; }
+  .vbar button[aria-pressed=true] { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .vbar input.pg { width:4.5ch; padding:3px 4px; text-align:center; border:1px solid var(--line);
+    border-radius:6px; background:var(--bg); color:var(--ink);
+    font:600 12px/1.5 ui-monospace,Menlo,monospace; }
+  .vbar .tot { font:600 12px/1.5 ui-monospace,Menlo,monospace; color:var(--muted); }
+  .vbar a { margin-left:auto; font:500 12px/1.3 inherit; color:var(--muted); text-decoration:none; }
+  .vbar a:hover { color:var(--accent); text-decoration:underline; }
+
+  /* margin:auto rather than justify-content:center — a flex-centred child wider
+     than the scroll container has its left edge clipped and unreachable. */
+  #stage { flex:1; overflow:auto; min-height:0; padding:12px; background:var(--bg); }
+  #stage.empty { display:flex; align-items:center; justify-content:center; }
+  .vempty { color:var(--muted); font-size:13.5px; max-width:44ch; text-align:center; }
+  /* The page itself: canvas + selectable text + our marks, all in one stack. */
+  #pagebox { position:relative; margin:0 auto; width:max-content; background:#fff;
+             box-shadow:0 1px 3px #0003, 0 8px 24px #0000001a; }
+  #pagebox.hide { display:none; }
+  #pdfCanvas { display:block; }
+  #marks { position:absolute; inset:0; pointer-events:none; }
+  #loading { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+             background:#ffffffb0; font-size:12.5px; color:var(--muted); }
+  #pagebox.busy #loading { display:flex; }
+  @media (prefers-color-scheme: dark){ #loading { background:#1d1d23b0; } }
+
+  /* pdf.js text layer — the rules the library needs to place its spans, lifted
+     from pdf_viewer.css. It sits above the canvas so the PDF text is
+     selectable; the marks layer above it is pointer-events:none. */
+  .textLayer { position:absolute; text-align:initial; inset:0; overflow:clip; opacity:1;
+    line-height:1; text-size-adjust:none; forced-color-adjust:none; transform-origin:0 0;
+    caret-color:CanvasText; z-index:1; }
+  .textLayer :is(span,br) { color:transparent; position:absolute; white-space:pre;
+    cursor:text; transform-origin:0% 0%; }
+  .textLayer > :not(.markedContent),
+  .textLayer .markedContent span:not(.markedContent) { z-index:1; }
+  .textLayer span.markedContent { top:0; height:0; }
+  .textLayer span[role=img] { user-select:none; cursor:default; }
+  .textLayer ::selection { background:color-mix(in srgb, AccentColor, transparent 75%); }
+  .textLayer br::selection { background:transparent; }
+  .textLayer .endOfContent { display:block; position:absolute; inset:100% 0 0; z-index:0;
+    cursor:default; user-select:none; }
+  .textLayer.selecting .endOfContent { top:0; }
+
+  /* Quote highlight: translucent wash + underline, so the text stays readable. */
+  .hl { position:absolute; background:color-mix(in srgb, var(--hl) 42%, transparent);
+        border-bottom:2px solid var(--hlbd); border-radius:2px;
+        box-shadow:0 0 0 1px color-mix(in srgb, var(--hlbd) 40%, transparent);
+        transition:box-shadow .2s; }
+  .hl.other { background:color-mix(in srgb, var(--hl) 20%, transparent);
+              border-bottom-color:color-mix(in srgb, var(--hlbd) 55%, transparent); }
+  /* No text-layer match: the visually matched region, marked as approximate. */
+  .hl.approx { background:color-mix(in srgb, var(--hl) 16%, transparent);
+               border:2px dashed var(--hlbd); border-radius:4px; }
+  .hl.flash { animation:fl 1.2s ease-out 2; }
+  @keyframes fl { 0%,100%{ box-shadow:0 0 0 1px color-mix(in srgb,var(--hlbd) 40%,transparent); }
+                  50%{ box-shadow:0 0 0 6px color-mix(in srgb,var(--hl) 55%,transparent),
+                                 0 0 18px 6px color-mix(in srgb,var(--hlbd) 45%,transparent); } }
+  .hl b { position:absolute; left:0; top:-1.55em; background:var(--hlbd); color:#fff;
+          padding:0 5px; border-radius:4px; font:700 10px/1.55 ui-monospace,Menlo,monospace;
+          white-space:nowrap; box-shadow:0 1px 4px #0004; }
+
+  /* Figures from the answer prose, located on this page. */
+  .num { position:absolute; border:2px solid var(--num); background:var(--numbg);
+         border-radius:3px; }
+  .num.amb { border-style:dashed; border-color:var(--muted); background:transparent; }
+  .num b { position:absolute; left:50%; bottom:100%; transform:translateX(-50%);
+           margin-bottom:3px; background:var(--num); color:#fff; padding:1px 5px;
+           border-radius:4px; font:700 10px/1.5 ui-monospace,Menlo,monospace; white-space:nowrap; }
+  .num.amb b { display:none; }
+
+  /* PixelRAG's matched region — diagnostic, off by default. */
+  .box { position:absolute; border:1px dashed var(--accent); opacity:.45; border-radius:2px; }
+  body:not(.show-chunks) .box { display:none; }
+
+  /* Footer: which citation is on screen, and how much to trust it. */
+  .vfoot { border-top:1px solid var(--line); background:var(--panel);
+           padding:7px 12px; font-size:12.5px; color:var(--muted);
+           display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-height:34px; }
+  .vfoot .cn { font:700 11px/1.6 ui-monospace,Menlo,monospace; color:var(--ink); flex:none; }
+  .vfoot q { color:var(--ink); font-style:normal; }
+  .vfoot .warn { color:var(--warn); }
+  .vfoot button { padding:1px 7px; border:1px solid var(--line); background:var(--bg);
+    color:var(--ink); border-radius:5px; font:600 11px/1.5 inherit; cursor:pointer; }
+  .vfoot button:hover { border-color:var(--accent); color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dokumentacja — wyszukiwanie wizualne</h1>
+  <span class="sub" id="corpus">ładowanie korpusu…</span>
+  <div class="tools">
+    <label class="keybar">
+      <span class="sub">klucz API</span>
+      <input id="apiKey" type="password" autocomplete="off" spellcheck="false"
+             placeholder="opcjonalnie — nadpisuje zmienną środowiskową">
+    </label>
+    <label class="chk"><input type="checkbox" id="chunks"> regiony PixelRAG</label>
+  </div>
+</header>
+
+<div id="layout">
+  <section id="chat">
+    <div id="log">
+      <div class="msg bot"><div class="body">Zadaj pytanie o zaindeksowane katalogi i cenniki — po polsku lub angielsku. Odpowiedź jest pokazana w oryginalnym PDF-ie po prawej: kliknij cytat, aby otworzyć dokument na tej stronie z podświetlonym fragmentem.</div></div>
+    </div>
+    <form id="form">
+      <input id="q" type="text" autocomplete="off" required
+             placeholder="np. Ile kosztuje brama ręczna SNP 2500x2100 RAL 7016">
+      <button class="go" id="send">Zapytaj</button>
+    </form>
+  </section>
+
+  <section id="viewer">
+    <div class="vbar">
+      <select id="docSel" title="dokument" aria-label="dokument"></select>
+      <span class="grp">
+        <button id="prevPg" title="poprzednia strona (PgUp)">◀</button>
+        <input class="pg" id="pgNum" inputmode="numeric" autocomplete="off" aria-label="strona">
+        <span class="tot" id="pgTot">/ –</span>
+        <button id="nextPg" title="następna strona (PgDn)">▶</button>
+      </span>
+      <span class="grp">
+        <button id="zOut" title="pomniejsz">−</button>
+        <button id="zFit" aria-pressed="true" title="dopasuj do szerokości">dopasuj</button>
+        <button id="zIn" title="powiększ">+</button>
+        <span class="tot" id="zLbl">—</span>
+      </span>
+      <a id="openPdf" href="#" target="_blank" rel="noopener" hidden>otwórz PDF ↗</a>
+    </div>
+    <div id="stage" class="empty">
+      <div id="pagebox" class="hide">
+        <canvas id="pdfCanvas"></canvas>
+        <div class="textLayer" id="textLayer"></div>
+        <div id="marks"></div>
+        <div id="loading">renderuję stronę…</div>
+      </div>
+      <div class="vempty" id="vempty">Tutaj otworzy się źródłowy PDF — na stronie, z której pochodzi odpowiedź, z podświetlonym cytatem.</div>
+    </div>
+    <div class="vfoot" id="vfoot"><span>Brak otwartego dokumentu.</span></div>
+  </section>
+</div>
+
+<script type="module">
+import * as pdfjsLib from '/vendor/pdf.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+
+const logEl = document.getElementById('log');
+const form = document.getElementById('form');
+const qEl = document.getElementById('q');
+const sendEl = document.getElementById('send');
+const keyEl = document.getElementById('apiKey');
+const stage = document.getElementById('stage');
+const pagebox = document.getElementById('pagebox');
+const canvas = document.getElementById('pdfCanvas');
+const textLayerEl = document.getElementById('textLayer');
+const marksEl = document.getElementById('marks');
+const vemptyEl = document.getElementById('vempty');
+const vfootEl = document.getElementById('vfoot');
+const docSel = document.getElementById('docSel');
+const pgNum = document.getElementById('pgNum');
+const pgTot = document.getElementById('pgTot');
+const prevPg = document.getElementById('prevPg');
+const nextPg = document.getElementById('nextPg');
+const zLbl = document.getElementById('zLbl');
+const openPdf = document.getElementById('openPdf');
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+// Small, escape-first markdown for answer prose — bold/italic, lists, paragraphs.
+// No HTML from the model is trusted; everything is escaped before tags go in.
+function inlineMd(s){
+  let t = esc(s);
+  t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*(?!\s)([^*]+?)(?<!\s)\*(?!\*)/g, '$1<em>$2</em>');
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return t;
+}
+function mdToHtml(src){
+  const lines = String(src ?? '').replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length){
+    if (!lines[i].trim()){ i++; continue; }
+    const isOl = /^(\d+)\.\s+/.test(lines[i]);
+    const isUl = /^([*+\-])\s+/.test(lines[i]);
+    if (isOl || isUl){
+      const ordered = isOl;
+      const tag = ordered ? 'ol' : 'ul';
+      const startMatch = ordered ? lines[i].match(/^(\d+)\.\s+/) : null;
+      const attrs = ordered && startMatch && startMatch[1] !== '1'
+        ? ` start="${esc(startMatch[1])}"` : '';
+      const items = [];
+      while (i < lines.length){
+        const m = ordered
+          ? lines[i].match(/^(\d+)\.\s+(.*)$/)
+          : lines[i].match(/^([*+\-])\s+(.*)$/);
+        if (!m) break;
+        let text = m[2];
+        const nested = [];
+        i++;
+        while (i < lines.length){
+          const nm = lines[i].match(/^\s{2,}([*+\-]|\d+\.)\s+(.*)$/);
+          if (nm){ nested.push(nm[2]); i++; continue; }
+          if (!lines[i].trim()) break;
+          if (/^(\d+)\.\s+/.test(lines[i]) || /^([*+\-])\s+/.test(lines[i])) break;
+          if (/^\s{2,}\S/.test(lines[i])){ text += ' ' + lines[i].trim(); i++; continue; }
+          break;
+        }
+        let li = inlineMd(text);
+        if (nested.length)
+          li += `<ul>${nested.map(t => `<li>${inlineMd(t)}</li>`).join('')}</ul>`;
+        items.push(`<li>${li}</li>`);
+      }
+      out.push(`<${tag}${attrs}>${items.join('')}</${tag}>`);
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && lines[i].trim()
+           && !/^(\d+)\.\s+/.test(lines[i]) && !/^([*+\-])\s+/.test(lines[i])){
+      para.push(lines[i].trim());
+      i++;
+    }
+    out.push(`<p>${inlineMd(para.join(' '))}</p>`);
+  }
+  return out.join('') || `<p>${inlineMd(src)}</p>`;
+}
+
+// ---------------------------------------------------------------- viewer state
+// One document on screen at a time. `pages` remembers what search retrieved
+// (for the region overlay and the document list), `cites` what the answer
+// claimed, so a page can be re-marked whenever we navigate back to it.
+const V = {
+  pdfs: new Map(),          // article_id -> Promise<PDFDocumentProxy>
+  titles: new Map(),        // article_id -> document title
+  pages: new Map(),         // "article:page" -> retrieved page meta (box, score)
+  cites: [], pins: [],
+  active: -1,               // index into V.cites
+  activeRects: [],          // highlight elements of the active citation
+  pdf: null, aid: null, page: 0, total: 0,
+  scale: 1, fit: true,
+  gen: 0, task: null,
+};
+
+function loadPdf(aid){
+  if (!V.pdfs.has(aid)){
+    // disableAutoFetch: the gate price list is 82 MB; with Range requests
+    // pdf.js pulls only the pages we actually render.
+    V.pdfs.set(aid, pdfjsLib.getDocument({
+      url: `/api/pdf/${aid}`, disableAutoFetch: true, rangeChunkSize: 262144,
+    }).promise.catch(err => { V.pdfs.delete(aid); throw err; }));
+  }
+  return V.pdfs.get(aid);
+}
+
+async function show(aid, page, citeIdx = -1){
+  const gen = ++V.gen;
+  V.active = citeIdx;
+  markActiveCiteButton();
+  if (aid !== V.aid || !V.pdf){
+    pagebox.classList.add('busy');
+    let pdf;
+    try {
+      pdf = await loadPdf(aid);
+    } catch (err){
+      pagebox.classList.add('hide'); pagebox.classList.remove('busy');
+      vemptyEl.hidden = false; stage.classList.add('empty');
+      vemptyEl.innerHTML = `<span class="err">Nie udało się otworzyć PDF-a: ${esc(err.message || err)}</span>`;
+      return;
+    }
+    if (gen !== V.gen) return;
+    V.pdf = pdf; V.aid = aid; V.total = pdf.numPages;
+  }
+  vemptyEl.hidden = true; stage.classList.remove('empty');
+  pagebox.classList.remove('hide');
+  V.page = clamp(page | 0 || 1, 1, V.total);
+  syncBar();
+  await render(gen);
+  if (gen !== V.gen) return;
+  drawMarks();
+  focusActive();
+}
+
+function syncBar(){
+  pgNum.value = V.page || '';
+  pgTot.textContent = '/ ' + (V.total || '–');
+  prevPg.disabled = V.page <= 1;
+  nextPg.disabled = !V.total || V.page >= V.total;
+  openPdf.hidden = V.aid == null;
+  if (V.aid != null) openPdf.href = `/api/pdf/${V.aid}#page=${V.page}`;
+  if (docSel.value !== String(V.aid)) docSel.value = String(V.aid);
+  // Before the render, not after it: a page label that lags the page it labels
+  // is worse than no label.
+  renderFoot();
+}
+
+async function render(gen){
+  const page = await V.pdf.getPage(V.page);
+  if (gen !== V.gen) return;
+  const base = page.getViewport({ scale: 1 });
+  if (V.fit) V.scale = clamp((stage.clientWidth - 28) / base.width, 0.1, 8);
+  const vp = page.getViewport({ scale: V.scale });
+  const dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+  const w = Math.round(vp.width), h = Math.round(vp.height);
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  pagebox.style.width = w + 'px'; pagebox.style.height = h + 'px';
+  marksEl.textContent = ''; textLayerEl.textContent = '';
+
+  if (V.task){ V.task.cancel(); V.task = null; }
+  pagebox.classList.add('busy');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const task = page.render({
+    canvasContext: ctx, viewport: vp,
+    transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null,
+  });
+  V.task = task;
+  try {
+    await task.promise;
+  } catch (err){
+    if (err?.name !== 'RenderingCancelledException') console.error(err);
+    return;
+  } finally {
+    if (V.task === task) V.task = null;
+    if (gen === V.gen) pagebox.classList.remove('busy');
+  }
+  if (gen !== V.gen) return;
+  zLbl.textContent = Math.round(V.scale * 100) + '%';
+
+  // Selectable text over the canvas — copying a price out of the source is a
+  // normal thing to want, and it also makes browser Ctrl-F work on the page.
+  textLayerEl.style.setProperty('--scale-factor', String(V.scale));
+  const tl = new pdfjsLib.TextLayer({
+    textContentSource: page.streamTextContent(), container: textLayerEl, viewport: vp,
+  });
+  try { await tl.render(); } catch { /* text layer is a nicety, never fatal */ }
+  if (gen !== V.gen) textLayerEl.textContent = '';
+}
+
+// All marks for the page now on screen: every citation that lands here (the
+// active one emphasised), the figures found in the answer, and — behind the
+// checkbox — the region PixelRAG actually matched.
+function drawMarks(){
+  marksEl.textContent = '';
+  if (V.aid == null) return;
+  const rect = (cls, r, label, title) => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.style.cssText = `left:${r.left}%;top:${r.top}%;width:${r.width}%;height:${r.height}%`;
+    if (label != null) d.innerHTML = `<b>${esc(label)}</b>`;
+    if (title) d.title = title;
+    marksEl.appendChild(d);
+    return d;
+  };
+  const here = c => c.article_id === V.aid && c.page === V.page;
+  const meta = V.pages.get(V.aid + ':' + V.page);
+
+  V.activeRects = [];
+  V.cites.forEach((c, i) => {
+    if (!here(c)) return;
+    const on = i === V.active;
+    if (c.rects && c.rects.length){
+      c.rects.forEach((r, j) => {
+        const el = rect('hl' + (on ? '' : ' other'), r, j === 0 ? i + 1 : null,
+                        c.quote);
+        if (on) V.activeRects.push(el);
+      });
+    } else if (meta?.box){
+      // No text-layer match — point at the region the visual search matched,
+      // dashed, so it never reads as "this exact line".
+      const el = rect('hl approx' + (on ? '' : ' other'), meta.box, i + 1,
+                      'region dopasowany wizualnie — nie dokładny wiersz');
+      if (on) V.activeRects.push(el);
+    }
+    (c.numbers || []).forEach(v =>
+      rect('num', v, v.value, `${v.value} — występuje raz na tej stronie`));
+  });
+
+  // Agent mode returns no citation block; its figure pins are all we have.
+  if (!V.cites.some(here)){
+    V.pins.filter(here).forEach(p =>
+      rect('num' + (p.ambiguous ? ' amb' : ''), p, p.ambiguous ? null : p.value,
+           p.ambiguous ? `${p.value} — powtarza się na stronie; sprawdź wiersz i kolumnę`
+                       : p.value));
+  }
+  if (meta?.box) rect('box', meta.box, null, 'region dopasowany przez PixelRAG');
+  renderFoot();
+}
+
+function focusActive(){
+  const el = (V.activeRects || [])[0];
+  if (!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+}
+
+function renderFoot(){
+  const c = V.cites[V.active];
+  if (!c){
+    const t = V.aid != null ? V.titles.get(V.aid) : null;
+    vfootEl.innerHTML = t
+      ? `<span>${esc(t)} — strona ${V.page}${V.total ? ' z ' + V.total : ''}</span>`
+      : '<span>Brak otwartego dokumentu.</span>';
+    return;
+  }
+  const total = V.cites.length;
+  const notes = [];
+  if (!c.rects?.length){
+    notes.push(c.text_layer
+      ? 'Cytatu nie znaleziono w warstwie tekstowej tej strony — sprawdź odpowiedź uważnie.'
+      : 'Strona bez warstwy tekstowej — podświetlono region dopasowany wizualnie.');
+  }
+  const rep = (c.repeated || []).filter(r => r.count > 1);
+  if (rep.length)
+    notes.push('Nie oznaczono (wartość powtarzalna): ' +
+      rep.map(r => `${esc(r.value)} ×${r.count}`).join(', ') + '.');
+  vfootEl.innerHTML = `
+    <span class="cn">cytat ${V.active + 1}/${total}</span>
+    <button id="cPrev" title="poprzedni cytat (←)">◀</button>
+    <button id="cNext" title="następny cytat (→)">▶</button>
+    <q>${esc(c.quote)}</q>
+    ${c.verified ? `<span class="badge" title="dopasowano ${Math.round((c.coverage||0)*100)}% słów cytatu">✓</span>` : ''}
+    ${notes.length ? `<span class="warn">${notes.join(' ')}</span>` : ''}`;
+  vfootEl.querySelector('#cPrev').onclick = () => stepCite(-1);
+  vfootEl.querySelector('#cNext').onclick = () => stepCite(1);
+}
+
+function stepCite(d){
+  if (!V.cites.length) return;
+  const i = ((V.active < 0 ? (d > 0 ? -1 : 0) : V.active) + d + V.cites.length) % V.cites.length;
+  const c = V.cites[i];
+  show(c.article_id, c.page, i);
+}
+
+let citeBtns = [];
+function markActiveCiteButton(){
+  citeBtns.forEach((b, i) => b.setAttribute('aria-current', String(i === V.active)));
+}
+
+// The document picker lists only what this answer touched — cited pages first,
+// so "1 pdf" stays true without hiding a second source when there is one.
+function syncDocList(){
+  const ids = [];
+  V.cites.forEach(c => ids.includes(c.article_id) || ids.push(c.article_id));
+  [...V.pages.values()].forEach(p => ids.includes(p.article_id) || ids.push(p.article_id));
+  docSel.innerHTML = ids.map(id => {
+    const n = [...V.pages.values()].filter(p => p.article_id === id).length;
+    return `<option value="${id}">${esc(V.titles.get(id) || '?')}${n > 1 ? ` (${n} stron)` : ''}</option>`;
+  }).join('');
+  docSel.disabled = ids.length < 2;
+  if (V.aid != null) docSel.value = String(V.aid);
+}
+
+docSel.addEventListener('change', () => {
+  const aid = Number(docSel.value);
+  const ci = V.cites.findIndex(c => c.article_id === aid);
+  if (ci >= 0) return void show(aid, V.cites[ci].page, ci);
+  const p = [...V.pages.values()].find(x => x.article_id === aid);
+  show(aid, p ? p.page : 1, -1);
+});
+prevPg.addEventListener('click', () => show(V.aid, V.page - 1, -1));
+nextPg.addEventListener('click', () => show(V.aid, V.page + 1, -1));
+pgNum.addEventListener('change', () => {
+  const n = parseInt(pgNum.value, 10);
+  if (V.aid == null || !Number.isFinite(n)) return syncBar();
+  show(V.aid, n, -1);
+});
+document.getElementById('zIn').addEventListener('click', () => setZoom(V.scale * 1.25));
+document.getElementById('zOut').addEventListener('click', () => setZoom(V.scale / 1.25));
+document.getElementById('zFit').addEventListener('click', () => {
+  V.fit = true; document.getElementById('zFit').setAttribute('aria-pressed', 'true');
+  reflow();
+});
+function setZoom(s){
+  V.fit = false; document.getElementById('zFit').setAttribute('aria-pressed', 'false');
+  V.scale = clamp(s, 0.15, 8);
+  reflow();
+}
+async function reflow(){
+  if (V.aid == null) return;
+  const gen = ++V.gen;
+  await render(gen);
+  if (gen === V.gen) drawMarks();
+}
+let rt;
+addEventListener('resize', () => {
+  if (!V.fit || V.aid == null) return;
+  clearTimeout(rt); rt = setTimeout(reflow, 180);
+});
+
+document.getElementById('chunks').addEventListener('change', e =>
+  document.body.classList.toggle('show-chunks', e.target.checked));
+
+// ←/→ walk citations; PgUp/PgDn walk pages of the open document.
+addEventListener('keydown', e => {
+  if (document.activeElement === qEl || document.activeElement === keyEl
+      || document.activeElement === pgNum) return;
+  if (e.key === 'ArrowRight' || e.key === 'ArrowLeft'){
+    if (!V.cites.length) return;
+    e.preventDefault(); stepCite(e.key === 'ArrowRight' ? 1 : -1);
+  } else if (e.key === 'PageDown' || e.key === 'PageUp'){
+    if (V.aid == null) return;
+    e.preventDefault(); show(V.aid, V.page + (e.key === 'PageDown' ? 1 : -1), -1);
+  }
+});
+
+// ------------------------------------------------------------------- chat side
+fetch('/api/docs').then(r => r.json()).then(d => {
+  const pages = d.docs.reduce((n, x) => n + x.pages, 0);
+  document.getElementById('corpus').textContent = `${d.docs.length} dok. · ${pages} stron`;
+  d.docs.forEach(x => V.titles.set(x.article_id, x.title));
+}).catch(() => {});
+
+function addMsg(cls, html){
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls; el.innerHTML = html;
+  logEl.appendChild(el); logEl.scrollTop = logEl.scrollHeight;
+  return el;
+}
+
+function resetSources(){
+  V.pages.clear(); V.cites = []; V.pins = []; V.active = -1; V.activeRects = [];
+  citeBtns = [];
+  V.gen++; if (V.task){ V.task.cancel(); V.task = null; }
+  V.pdf = null; V.aid = null; V.page = 0; V.total = 0;
+  pagebox.classList.add('hide'); pagebox.classList.remove('busy');
+  marksEl.textContent = ''; textLayerEl.textContent = '';
+  stage.classList.add('empty'); vemptyEl.hidden = false;
+  vemptyEl.textContent = 'Szukam strony w dokumentach…';
+  docSel.innerHTML = ''; docSel.disabled = true;
+  syncBar(); renderFoot();
+}
+
+// A retrieved page: remembered, and shown immediately if nothing is open yet —
+// watching the agent land on a page is half the diagnostic value.
+function notePage(ev){
+  V.titles.set(ev.article_id, ev.document);
+  const id = ev.article_id + ':' + ev.page;
+  if (!V.pages.has(id))
+    V.pages.set(id, { article_id: ev.article_id, page: ev.page, document: ev.document,
+                      box: ev.box || null, score: ev.score, n_chunks: ev.n_chunks });
+  syncDocList();
+  if (V.aid == null) show(ev.article_id, ev.page, -1);
+}
+
+function renderCitations(container, cites){
+  if (!cites.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'cites';
+  wrap.innerHTML = '<h4>Cytaty — kliknij, aby otworzyć w PDF</h4>';
+  citeBtns = [];
+  cites.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'cite';
+    const badge = c.verified
+      ? `<span class="badge" title="cytat znaleziony w warstwie tekstowej (${Math.round((c.coverage||0)*100)}% słów)">✓</span>`
+      : `<span class="badge no" title="${c.text_layer ? 'nie znaleziono na tej stronie' : 'strona bez warstwy tekstowej'}">?</span>`;
+    b.innerHTML = `<span class="n">${i + 1}</span>
+      <span><q>${esc(c.quote)}</q>
+        <span class="where">— ${esc(c.supports || '')} · ${esc(V.titles.get(c.article_id) || '')} s. ${c.page}</span></span>
+      ${badge}`;
+    b.addEventListener('click', () => show(c.article_id, c.page, i));
+    wrap.appendChild(b);
+    citeBtns.push(b);
+  });
+  container.appendChild(wrap);
+  markActiveCiteButton();
+}
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const question = qEl.value.trim(); if (!question) return;
+  qEl.value = ''; sendEl.disabled = true;
+  resetSources();
+  addMsg('user', esc(question));
+  const bot = addMsg('bot',
+    `<div class="trace"></div><div class="body meta"><span class="spin"></span> szukam…</div>`);
+  const traceEl = bot.querySelector('.trace');
+  const bodyEl = bot.querySelector('.body');
+
+  function step(icon, html, target){
+    const row = document.createElement('div');
+    row.className = 'step' + (target ? ' viewed' : '');
+    row.innerHTML = `<span class="ic">${icon}</span><span>${html}</span>`;
+    if (target) row.addEventListener('click', () => show(target[0], target[1], -1));
+    traceEl.appendChild(row);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  try {
+    const res = await fetch('/api/ask', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ question, api_key: keyEl.value.trim() || null }),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream:true });
+      let nl;
+      while ((nl = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, nl); buf = buf.slice(nl + 2);
+        if (!raw.startsWith('data: ')) continue;
+        const { kind, payload } = JSON.parse(raw.slice(6));
+
+        if (kind === 'event') {
+          if (payload.type === 'search') {
+            const vs = (payload.variants || []).map(v => esc(v.query)).join(' · ');
+            step('⌕', `szukano: <code>${vs || esc(payload.query)}</code> — ${payload.hits.length} stron`);
+          } else if (payload.type === 'tile') {
+            notePage(payload);
+            step('▣', `<code>${esc(payload.document)} s.${payload.page}</code>`,
+                 [payload.article_id, payload.page]);
+          } else if (payload.type === 'tile_error') {
+            step('!', `<span class="err">brak regionu ${payload.tile_index}:${payload.chunk_index}</span>`);
+          }
+        } else if (kind === 'done') {
+          bodyEl.classList.remove('meta');
+          bodyEl.innerHTML = mdToHtml(payload.answer);
+          V.cites = payload.citations || [];
+          V.pins = payload.pins || [];
+          V.cites.forEach(c => V.titles.set(c.article_id, c.document || V.titles.get(c.article_id)));
+          syncDocList();
+          renderCitations(bot, V.cites);
+          // Open the document at the first thing the answer actually cited.
+          if (V.cites.length) show(V.cites[0].article_id, V.cites[0].page, 0);
+          else if (V.aid != null) drawMarks();
+          else vemptyEl.textContent = 'Ta odpowiedź nie wskazuje strony źródłowej.';
+          const u = payload.usage || {};
+          const cost = u.cost_usd != null ? ` · ~$${u.cost_usd.toFixed(3)}` : '';
+          const m = document.createElement('div');
+          m.className = 'meta';
+          m.textContent = `${payload.provider}/${payload.model} · ${u.input||0} in / ${u.output||0} out${cost}`;
+          bot.appendChild(m);
+        } else if (kind === 'error') {
+          bodyEl.classList.remove('meta');
+          bodyEl.innerHTML = `<span class="err">${esc(payload)}</span>`;
+        }
+      }
+    }
+  } catch (err) {
+    bodyEl.classList.remove('meta');
+    bodyEl.innerHTML = `<span class="err">${esc(err.message || err)}</span>`;
+  } finally {
+    sendEl.disabled = false; qEl.focus();
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+});
+qEl.focus();
+</script>
+</body>
+</html>

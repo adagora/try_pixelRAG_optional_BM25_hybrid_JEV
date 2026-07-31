@@ -1,0 +1,10 @@
+{
+  "backend": "ivf",
+  "total_vectors": 301,
+  "dimension": 2048,
+  "nlist": 7,
+  "nprobe": 128,
+  "metric": "ip",
+  "index_file": "index/index.faiss",
+  "metadata_file": "index/metadata.npz"
+}

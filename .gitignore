@@ -1,0 +1,19 @@
+.DS_Store
+.env
+.venv/
+.venv_encoder/
+*.pyc
+__pycache__/
+
+# source PDFs (large; tiles/embeddings are what chat needs)
+pdfs/
+
+# build leftovers inside index (final shard + faiss are enough)
+index/_probe/
+index/embeddings/partial_*.npz
+index/embeddings/checkpoint.json
+
+# service logs (serve_all.py)
+logs/
+logs_serveall.log
+undefined/

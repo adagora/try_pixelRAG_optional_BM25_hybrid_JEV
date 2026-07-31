@@ -1,0 +1,4 @@
+index/**/*.faiss filter=lfs diff=lfs merge=lfs -text
+index/**/*.npz filter=lfs diff=lfs merge=lfs -text
+index/tiles/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+index/tiles/**/*.png filter=lfs diff=lfs merge=lfs -text
