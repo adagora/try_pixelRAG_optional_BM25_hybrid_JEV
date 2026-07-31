@@ -35,7 +35,7 @@ template, same instruction, same last-token pooling — or queries land in a
 different space from the indexed documents. Faithful, not bit-identical: fp16,
 the padding and the graph each move the last bits, together 7.9e-04 on an index
 score at cos 0.999994, every ranking unchanged. scripts/check_parity.py is the
-gate; scripts/parity_check.py sweeps the knobs behind it.
+gate — its --attn/--tokenise/--pad-to/--compile flags sweep the knobs.
 """
 
 import os

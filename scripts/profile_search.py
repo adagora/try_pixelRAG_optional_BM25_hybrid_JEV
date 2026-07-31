@@ -101,7 +101,7 @@ def pad_inputs(torch, processor, inputs: dict, pad_to: int) -> dict:
     so no real token can see a pad token and the pooled last-real-token vector is
     the same value in exact arithmetic. It is *not* the same computation — the
     kernels now run over a longer sequence, so reductions tile differently and
-    the last bits move. parity_check.py is how that gets quantified, not assumed.
+    the last bits move. check_parity.py is how that gets quantified, not assumed.
     """
     n = inputs["input_ids"].shape[1]
     if not pad_to or n > pad_to:

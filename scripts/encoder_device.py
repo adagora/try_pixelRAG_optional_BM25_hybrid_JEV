@@ -11,7 +11,7 @@ Every knob here was measured rather than guessed, and all but the tokeniser cost
 some precision against the fp32 reference; the numbers quoted below come from
 
     python scripts/sweep_encoder.py --repeats 4 --n 100 --warmup 12
-    python scripts/parity_check.py --dtype fp16 --tokenise fast --pad-to 64 \
+    python scripts/check_parity.py --dtype fp16 --tokenise fast --pad-to 64 \
         --compile cudagraphs --verify-server
 """
 

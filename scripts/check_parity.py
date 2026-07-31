@@ -28,6 +28,24 @@ pass/fail, top-1 is what a reader that opens one tile actually sees.
 Exit 0 only if every query's top-5 set matches and the worst-case cosine is
 >= 0.999. Requires `pixelrag serve` on --port. Never imports faiss — that
 segfault is the reason the encoder was split out in the first place.
+
+SWEEPING THE KNOBS BEHIND THE GATE. The shipped config is device and dtype,
+but encoder_device.py also chooses an attention implementation, a tokeniser, a
+padding width and whether the forward is graphed — and each of those moves the
+last bits of every embedding too. Those are the same question, so they are the
+same script:
+
+    python scripts/check_parity.py --pad-to 64 --compile cudagraphs \
+        --tokenise fast --verify-server
+
+Passing any of them routes both arms through profile_search.load/encode, which
+is where the knobs live. Without them the encode body below runs, which is a
+deliberate independent replication of pixelrag_serve._encode_queries — two
+copies that must agree is the point, not an oversight.
+
+--verify-server checks the REFERENCE against the live service's own encoder.
+Same code and dtype but a different torch build, so the residual there is the
+floor: no configuration can be called identical to the service below it.
 """
 
 import argparse
@@ -35,6 +53,7 @@ import gc
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -85,7 +104,8 @@ def questions(path: Path) -> list[dict]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def encode_all(texts: list[str], device: str, dtype_name: str) -> np.ndarray:
+def encode_all(texts: list[str], device: str, dtype_name: str,
+               knobs: dict | None = None) -> np.ndarray:
     """Load the model, encode every query, release it. Returns (n, dim) float32.
 
     The body below must stay step-for-step with
@@ -94,7 +114,15 @@ def encode_all(texts: list[str], device: str, dtype_name: str) -> np.ndarray:
     normalise. One query per forward, because that is what the serving path
     does: batching pads, and where the last real token lands is exactly what
     the pool indexes.
+
+    `knobs` (attn / tokenise / compile / pad_to) routes through
+    profile_search instead, which is the module that knows how to apply them.
+    Both paths encode identically at the default settings — the two-warm-up
+    calls are profile_search's, and they are what a graphed forward needs.
     """
+    if knobs:
+        return _encode_via_profile_search(texts, device, dtype_name, knobs)
+
     import torch
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
@@ -130,15 +158,66 @@ def encode_all(texts: list[str], device: str, dtype_name: str) -> np.ndarray:
     return np.stack(out)
 
 
+def _encode_via_profile_search(texts: list[str], device: str, dtype_name: str,
+                               knobs: dict) -> np.ndarray:
+    """The knob-sweeping path. Imported lazily so the default gate does not
+    depend on the profiling harness."""
+    import profile_search as ps
+
+    torch, model, processor = ps.load(
+        device, dtype_name, knobs.get("attn", "sdpa"),
+        knobs.get("tokenise", "stock"), knobs.get("compile", "off"),
+        knobs.get("pad_to", 0))
+    pad_to = knobs.get("pad_to", 0)
+    # A graphed forward records on its first calls; those are not measurements
+    # and must not be compared.
+    for text in texts[:2]:
+        ps.encode(torch, model, processor, text, device, pad_to)
+    out = np.vstack([ps.encode(torch, model, processor, t, device, pad_to)
+                     for t in texts])
+    del model, processor
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return out
+
+
 def key(hit: dict) -> tuple[int, int, int]:
     return (hit["article_id"], hit["tile_index"], hit["chunk_index"])
 
 
-def search(api: str, vector: np.ndarray) -> list[dict]:
-    r = requests.post(f"{api}/search",
-                      json={"queries": [{"embedding": vector.tolist()}],
-                            "n_docs": N_DOCS},
-                      timeout=120)
+def verify_server(api: str, ref_vecs: np.ndarray, texts: list[str]) -> None:
+    """Check the reference against the service's own encoder.
+
+    Same code and same dtype, but a different torch build (the .venv ships
+    CPU-only torch to host faiss), so the residual here is the floor: no
+    configuration can be called identical to the service below this much
+    difference. Reported, never a pass/fail — it measures the ground the gate
+    stands on, not the candidate.
+    """
+    worst_score, differing = 0.0, 0
+    for vec, text in zip(ref_vecs, texts):
+        by_text = search(api, None, text=text)
+        by_vec = search(api, vec)
+        if [key(h) for h in by_text] != [key(h) for h in by_vec]:
+            differing += 1
+        worst_score = max(worst_score,
+                          max((abs(a["score"] - b["score"])
+                               for a, b in zip(by_text, by_vec)), default=0.0))
+    print(f"[verify-server] reference vs service-encoded: max score delta "
+          f"{worst_score:.3e}, order differs on {differing}/{len(texts)} "
+          f"queries — this is the floor, not a failure\n")
+
+
+def search(api: str, vector: np.ndarray | None, text: str | None = None) -> list[dict]:
+    """Rank against the live index, by precomputed vector or by raw text.
+
+    The text form makes the service encode it itself, which is what
+    verify_server compares the reference against.
+    """
+    q = {"text": text} if vector is None else {"embedding": vector.tolist()}
+    r = requests.post(f"{api}/search", json={"queries": [q], "n_docs": N_DOCS},
+                      timeout=180)
     r.raise_for_status()
     return r.json()["results"][0]["hits"]
 
@@ -160,6 +239,35 @@ def _flag(ok: bool) -> str:
     return " ok  " if ok else "DIFF "
 
 
+def _cached_reference(texts: list[str], cache_path: str,
+                      use_cache: bool = True) -> np.ndarray:
+    """cpu/fp32 vectors for these exact queries, computed once and reused.
+
+    Never knob-swept: the reference is by definition the stock configuration,
+    and a cached one keyed on anything else would silently compare a candidate
+    against another candidate. Keyed on the query list, so editing the eval set
+    recomputes rather than pairing new questions with old vectors.
+    """
+    cache = Path(cache_path)
+    if use_cache and cache.exists():
+        try:
+            with np.load(cache, allow_pickle=True) as z:
+                if list(z["queries"]) == texts:
+                    print(f"reference: reused from {cache}")
+                    return z["ref"]
+        except (OSError, ValueError, KeyError):
+            pass                       # unreadable cache — recompute over it
+
+    print("reference:")
+    ref = encode_all(texts, "cpu", "fp32")
+    if use_cache:
+        try:
+            np.savez(cache, ref=ref, queries=np.array(texts, dtype=object))
+        except OSError as e:
+            print(f"  (could not cache the reference: {e})")
+    return ref
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Compare a candidate query encoder against cpu/float32.")
@@ -169,7 +277,33 @@ def main() -> int:
                     help="Candidate dtype; the reference is always fp32.")
     ap.add_argument("--port", type=int, default=30001)
     ap.add_argument("--questions", default="eval/questions.yaml")
+    # Knobs encoder_device.py also chooses, which move the embedding too.
+    # Passing any of them routes both arms through profile_search.
+    ap.add_argument("--attn", choices=["sdpa", "eager", "flash_attention_2"],
+                    help="attention implementation (default: sdpa)")
+    ap.add_argument("--tokenise", choices=["stock", "memo", "fast"],
+                    help="tokeniser path (default: stock)")
+    ap.add_argument("--compile", dest="compile_mode",
+                    choices=["off", "cudagraphs", "default", "reduce-overhead",
+                             "max-autotune"],
+                    help="graph/compile the forward (default: off)")
+    ap.add_argument("--pad-to", type=int,
+                    help="round token counts up to a multiple of this")
+    ap.add_argument("--verify-server", action="store_true",
+                    help="also report the reference against the service's own "
+                         "encoder — the floor any config is measured against")
+    ap.add_argument("--ref-cache",
+                    default=str(Path(tempfile.gettempdir()) /
+                                "pixelrag_parity_ref.npz"),
+                    help="the cpu/fp32 reference is slow; reuse it across runs")
+    ap.add_argument("--no-ref-cache", action="store_true",
+                    help="always recompute the reference")
     args = ap.parse_args()
+
+    knobs = {k: v for k, v in (("attn", args.attn),
+                               ("tokenise", args.tokenise),
+                               ("compile", args.compile_mode),
+                               ("pad_to", args.pad_to)) if v is not None}
 
     # The eval set is in Polish; a cp1252 console raises UnicodeEncodeError on
     # the first question and takes the verdict line down with it.
@@ -200,7 +334,8 @@ def main() -> int:
               "ranking comparison would be meaningless.")
         return 1
 
-    print(f"parity check  candidate={args.device}/{args.dtype}  "
+    knob_note = "  " + " ".join(f"{k}={v}" for k, v in knobs.items()) if knobs else ""
+    print(f"parity check  candidate={args.device}/{args.dtype}{knob_note}  "
           f"reference=cpu/fp32  queries={len(texts)}  n_docs={N_DOCS}\n")
 
     # Candidate first, then reference, and never both resident. from_pretrained
@@ -210,9 +345,13 @@ def main() -> int:
     # Order also decides how fast a mistake surfaces: a bad --device/--dtype
     # fails during the fast load rather than after paying for the slow one.
     print("candidate:")
-    cand_vecs = encode_all(texts, args.device, args.dtype)
-    print("reference:")
-    ref_vecs = encode_all(texts, "cpu", "fp32")
+    cand_vecs = encode_all(texts, args.device, args.dtype, knobs)
+
+    ref_vecs = _cached_reference(texts, args.ref_cache,
+                                 use_cache=not args.no_ref_cache)
+
+    if args.verify_server:
+        verify_server(api, ref_vecs, texts)
 
     rows = []
     for i, (item, ref_v, cand_v) in enumerate(zip(items, ref_vecs, cand_vecs)):
@@ -228,6 +367,10 @@ def main() -> int:
             "set": set(ref_order) == set(cand_order),
             "top1": ref_order[:1] == cand_order[:1],
             "dscore": score_delta(ref_hits, cand_hits),
+            # Per-component error. Cosine hides it — two vectors can agree to
+            # 0.999999 while individual components move by 1e-3 — and it is the
+            # number that tells you which knob is doing the damage.
+            "maxabs": float(np.abs(a - b).max()),
             "ref_order": ref_order, "cand_order": cand_order,
         })
 
@@ -246,12 +389,16 @@ def main() -> int:
         print(f"{r['n']:>3} {r['cos']:>10.6f} {r['dscore']:>9.6f}  "
               f"{_flag(r['order'])} {_flag(r['set'])}{_flag(r['top1'])} {r['q'][:38]}")
 
+    worst_q = min(rows, key=lambda r: r["cos"])
     print(f"\ncosine        worst {worst_cos:.6f}   mean "
           f"{sum(cosines)/n:.6f}   best {max(cosines):.6f}")
+    print(f"              worst query: {worst_q['q'][:60]!r}")
     print(f"top-5 order   {n_order}/{n} identical")
     print(f"top-5 set     {n_set}/{n} identical (order ignored)")
     print(f"top-1 hit     {n_top1}/{n} identical")
-    print(f"score delta   max {max_delta:.6f}")
+    print(f"score delta   max {max_delta:.3e}   (what faiss sorts on)")
+    print(f"component     max {max(r['maxabs'] for r in rows):.3e}   "
+          f"(per-component error, which cosine hides)")
 
     reordered = [r for r in rows if r["set"] and not r["order"]]
     if reordered:
@@ -283,7 +430,7 @@ def main() -> int:
     print(f"\n{'PARITY PASS' if ok else 'PARITY FAIL'}: {args.device}/{args.dtype} "
           f"vs cpu/fp32 — {n_set}/{n} top-5 sets, {n_order}/{n} exact order, "
           f"{n_top1}/{n} top-1, worst cosine {worst_cos:.6f}, max score delta "
-          f"{max_delta:.6f} ({n} eval queries, n_docs={N_DOCS}).")
+          f"{max_delta:.3e} ({n} eval queries, n_docs={N_DOCS}).")
     return 0 if ok else 1
 
 

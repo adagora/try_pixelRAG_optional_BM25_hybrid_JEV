@@ -35,21 +35,38 @@ pixelrag-serve-all = "serve_all:main"
 [tool.setuptools]
 package-dir = {"" = "scripts"}
 py-modules = [
+    "ab_encoder",
+    "answer_all",
     "answer_cache",
     "app",
     "ask",
+    "bench_search",
+    "build_index",
+    "build_text_index",
+    "check_parity",
+    "chunk_multiscale",
+    "chunkmeta",
     "citations",
     "encoder",
     "encoder_device",
+    "evaluate",
+    "evaluate_pl",
     "imagefit",
     "layout",
     "lexical",
+    "make_test_pdf",
+    "pagehit",
+    "prepare_hires",
+    "profile_search",
     "providers",
     "rag",
+    "resolution_probe",
     "retrieve",
     "serve_all",
     "snip",
+    "sweep_encoder",
     "tokenise_cache",
+    "transcribe",
 ]
 
 [tool.pytest.ini_options]
