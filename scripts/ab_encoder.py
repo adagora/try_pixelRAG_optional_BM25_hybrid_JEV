@@ -22,13 +22,9 @@ Both models must fit in VRAM at once (two fp16 copies is ~9GB of 16GB here).
 
 import argparse
 import statistics
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-import profile_search as ps  # noqa: E402
-from bench_search import query_set  # noqa: E402
+import profile_search as ps
+from bench_search import query_set
 
 
 def p95(xs: list[float]) -> float:

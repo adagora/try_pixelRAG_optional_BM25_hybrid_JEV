@@ -31,15 +31,12 @@ import cProfile
 import io
 import pstats
 import statistics
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+import yaml
 
-import yaml  # noqa: E402
-
-import tokenise_cache  # noqa: E402
+import tokenise_cache
 
 DEFAULT_INSTRUCTION = "Retrieve images or text relevant to the user's query."
 MODEL = "Qwen/Qwen3-VL-Embedding-2B"

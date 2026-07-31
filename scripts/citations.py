@@ -181,6 +181,33 @@ def locate_quote(pdf: str | Path, page: int, quote: str) -> list[dict]:
     }]
 
 
+def _figure_boxes(words: tuple[tuple, ...], term: str) -> list[tuple]:
+    """Every place `term` appears on the page, as (x0, y0, x1, y1).
+
+    Not a token equality test, because prices are typeset with thin/no-break
+    spaces ("3 956") and both PyMuPDF and _norm_tokens hand those back as two
+    tokens — so comparing against one token misses exactly the figures this is
+    here to pin. Consecutive digit tokens on the same line are joined the same
+    way _best_run joins hyphen fragments, and the box spans the run.
+    """
+    out = []
+    for i, w in enumerate(words):
+        if not w[4].isdigit() or not term.startswith(w[4]):
+            continue
+        joined, j = w[4], i
+        while joined != term and len(joined) < len(term) and j + 1 < len(words):
+            nxt = words[j + 1]
+            if nxt[5] != w[5] or not nxt[4].isdigit():
+                break                     # different line, or not a figure
+            if not term.startswith(joined + nxt[4]):
+                break
+            joined += nxt[4]
+            j += 1
+        if joined == term:
+            out.append((w[0], w[1], words[j][2], words[j][3]))
+    return out
+
+
 def locate_numbers(pdf: str | Path, page: int, text: str,
                    max_terms: int = 8) -> list[dict]:
     """Boxes for price/dimension figures in `text` that appear ONCE on `page`.
@@ -223,17 +250,17 @@ def locate_numbers(pdf: str | Path, page: int, text: str,
 
     pinned, repeated = [], []
     for term in wanted[:max_terms]:
-        hits = [w for w in words if w[4] == term]
-        if not hits:
+        boxes = _figure_boxes(words, term)
+        if not boxes:
             continue
-        if len(hits) > 1:
-            repeated.append({"value": term, "count": len(hits)})
+        if len(boxes) > 1:
+            repeated.append({"value": term, "count": len(boxes)})
             continue
-        w = hits[0]
+        x0, y0, x1, y1 = boxes[0]
         pinned.append({
             "value": term,
-            "left": 100 * w[0] / pw, "top": 100 * w[1] / ph,
-            "width": 100 * (w[2] - w[0]) / pw,
-            "height": 100 * (w[3] - w[1]) / ph,
+            "left": 100 * x0 / pw, "top": 100 * y0 / ph,
+            "width": 100 * (x1 - x0) / pw,
+            "height": 100 * (y1 - y0) / ph,
         })
     return pinned, repeated

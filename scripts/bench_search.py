@@ -26,11 +26,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-import rag  # noqa: E402
-import requests  # noqa: E402
-import yaml  # noqa: E402
+import rag
+import requests
+import yaml
 
 # Suffixes that lengthen a query without changing what it asks for. Token count
 # drives encoder cost, so a benchmark of only short queries understates the tail.

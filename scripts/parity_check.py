@@ -34,17 +34,14 @@ index has 36 vectors and generous score margins. Report the gap.
 
 import argparse
 import statistics
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+import numpy as np
+import requests
 
-import numpy as np  # noqa: E402
-import requests  # noqa: E402
-
-import profile_search as ps  # noqa: E402
-from bench_search import query_set  # noqa: E402
+import profile_search as ps
+from bench_search import query_set
 
 SEARCH_API = "http://127.0.0.1:30001"
 INDEX_EMB = Path("index/embeddings/shard_000.npz")

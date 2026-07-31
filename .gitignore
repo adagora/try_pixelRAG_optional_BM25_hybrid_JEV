@@ -24,3 +24,7 @@ index/transcripts/
 logs/
 logs_serveall.log
 undefined/
+
+# test/build artefacts
+.pytest_cache/
+*.egg-info/

@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "try-pixelrag"
+version = "0.1.0"
+description = "Visual RAG over technical PDFs — page-level retrieval, hybrid BM25, citations, web UI"
+requires-python = ">=3.12"
+# Runtime deps are deliberately NOT pinned here. This repo is a thin layer over
+# an upstream `pixelrag` install whose extras (index/serve/pdf) drag in torch,
+# faiss and transformers with platform-specific wheels; re-declaring them would
+# fight `uv pip install 'pixelrag[index,serve,pdf]'` rather than help it.
+# See README "Setup". What IS declared is what this layer adds on top.
+dependencies = [
+    "requests",
+    "numpy",
+    "pillow",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pixelrag-ask = "ask:main"
+pixelrag-serve-all = "serve_all:main"
+
+# Flat modules under scripts/, not a nested package. `python scripts/ask.py`
+# already puts scripts/ on sys.path[0], so this exists to make the same imports
+# work from any working directory after `pip install -e .` — and to give the
+# dependency graph a declared home instead of leaving it to sys.path accidents.
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+    "answer_cache",
+    "app",
+    "ask",
+    "citations",
+    "encoder",
+    "encoder_device",
+    "imagefit",
+    "layout",
+    "lexical",
+    "providers",
+    "rag",
+    "retrieve",
+    "serve_all",
+    "snip",
+    "tokenise_cache",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts"]
+addopts = "-q"
