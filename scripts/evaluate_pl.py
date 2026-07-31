@@ -86,7 +86,7 @@ def _improved(question: str, k: int) -> list[tuple[int, int]]:
     ranked, _ = retrieve.retrieve_pages(
         rag.search, question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k))
-    return [(p["article_id"], p["page"]) for p in ranked]
+    return [(p.article_id, p.page) for p in ranked]
 
 
 def _lexical(question: str, k: int) -> list[tuple[int, int]]:
@@ -124,7 +124,7 @@ def _hybrid(question: str, k: int, w: float = retrieve.LEX_WEIGHT
         rag.search, question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k),
         lexical_fn=lexical.search_text, lex_weight=w)
-    return [(p["article_id"], p["page"]) for p in ranked]
+    return [(p.article_id, p.page) for p in ranked]
 
 
 def _oracle(question: str, k: int) -> list[tuple[int, int]]:

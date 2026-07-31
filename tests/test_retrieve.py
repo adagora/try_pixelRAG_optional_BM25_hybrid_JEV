@@ -8,7 +8,26 @@ from __future__ import annotations
 
 import pytest
 
+import pagehit
 import retrieve
+from pagehit import Chunk, PageHit
+
+
+def page(tile_index, *, score, focus=None, source=pagehit.VISUAL,
+         extra_regions=0, article_id=0):
+    """A PageHit as aggregate() would have produced it.
+
+    `focus` is derived from the chunks, not set, so a test cannot construct a
+    record the real pipeline could not.
+    """
+    chunks = ()
+    if focus is not None:
+        chunks = tuple(
+            Chunk(chunk_index=focus + i, score=score, weighted=score,
+                  scale="region")
+            for i in range(1 + extra_regions))
+    return PageHit(article_id=article_id, tile_index=tile_index, score=score,
+                   chunks=chunks, sources=frozenset({source}))
 
 
 # -- query variants ---------------------------------------------------------
@@ -45,15 +64,15 @@ def test_aggregate_groups_chunks_by_page(scale_of, hits):
                              scale_of)
     assert len(out) == 2
     top = out[0]
-    assert (top["article_id"], top["tile_index"]) == (0, 0)
-    assert top["n_chunks"] == 2
-    assert top["page"] == 1                      # 1-based for display
+    assert (top.article_id, top.tile_index) == (0, 0)
+    assert top.n_chunks == 2
+    assert top.page == 1                      # 1-based for display
 
 
 def test_aggregate_agreement_bonus_is_applied(scale_of, hits):
     """best + AGREEMENT * sum(rest) — the whole reason pages beat chunks."""
     out = retrieve.aggregate(hits((0, 0, 1, 0.5), (0, 0, 2, 0.4)), scale_of)
-    assert out[0]["score"] == pytest.approx(0.5 + retrieve.AGREEMENT * 0.4)
+    assert out[0].score == pytest.approx(0.5 + retrieve.AGREEMENT * 0.4)
 
 
 def test_aggregate_one_clean_hit_beats_several_mediocre(scale_of, hits):
@@ -62,24 +81,24 @@ def test_aggregate_one_clean_hit_beats_several_mediocre(scale_of, hits):
         hits((0, 0, 1, 0.90),
              (0, 1, 1, 0.50), (0, 1, 2, 0.50)),
         scale_of)
-    assert out[0]["tile_index"] == 0
+    assert out[0].tile_index == 0
 
 
 def test_aggregate_focus_is_a_region_never_the_gist(scale_of, hits):
     """A gist box spans the page, so highlighting it would mean nothing."""
     out = retrieve.aggregate(hits((0, 0, 0, 0.9), (0, 0, 2, 0.4)), scale_of)
-    assert out[0]["focus"] == 2
+    assert out[0].focus == 2
 
 
 def test_aggregate_focus_none_when_only_gist_matched(scale_of, hits):
     out = retrieve.aggregate(hits((0, 0, 0, 0.9)), scale_of)
-    assert out[0]["focus"] is None
+    assert out[0].focus is None
 
 
 def test_aggregate_missing_manifest_degrades_to_region(hits):
     """An index built before `scale` was recorded must still rank."""
     out = retrieve.aggregate(hits((0, 0, 1, 0.5)), lambda a, t, c: "region")
-    assert out[0]["n_chunks"] == 1
+    assert out[0].n_chunks == 1
 
 
 # -- fusion of phrasings ----------------------------------------------------
@@ -87,12 +106,10 @@ def test_aggregate_missing_manifest_degrades_to_region(hits):
 def test_fuse_normalises_per_variant():
     """A two-word query scores lower against everything; magnitudes are not
     comparable across variants, only within one."""
-    a = [{"article_id": 0, "tile_index": 0, "score": 0.60, "chunks": [],
-          "focus": 1, "n_chunks": 1}]
-    b = [{"article_id": 0, "tile_index": 1, "score": 0.30, "chunks": [],
-          "focus": 2, "n_chunks": 1}]
+    a = [page(0, score=0.60, focus=1)]
+    b = [page(1, score=0.30, focus=2)]
     out = retrieve.fuse([a, b])
-    assert {p["norm"] for p in out} == {1.0}     # each is its own variant's best
+    assert {p.norm for p in out} == {1.0}     # each is its own variant's best
 
 
 def test_fuse_keeps_strongest_evidence_and_its_geometry():
@@ -100,70 +117,60 @@ def test_fuse_keeps_strongest_evidence_and_its_geometry():
     comparable between a full question and its noun phrase. Page 0 is variant
     A's also-ran and variant B's best, so B's chunk list is the one that
     survives, and the highlight box comes from B."""
-    a = [{"article_id": 0, "tile_index": 9, "score": 0.8, "chunks": [],
-          "focus": None, "n_chunks": 0},
-         {"article_id": 0, "tile_index": 0, "score": 0.5, "chunks": [{"x": 1}],
-          "focus": 1, "n_chunks": 1}]
-    b = [{"article_id": 0, "tile_index": 0, "score": 0.6, "chunks": [{"x": 2}],
-          "focus": 5, "n_chunks": 3}]
-    page0 = next(p for p in retrieve.fuse([a, b]) if p["tile_index"] == 0)
-    assert page0["focus"] == 5
-    assert page0["n_chunks"] == 3
+    a = [page(9, score=0.8),
+         page(0, score=0.5, focus=1)]
+    b = [page(0, score=0.6, focus=5, extra_regions=2)]
+    page0 = next(p for p in retrieve.fuse([a, b]) if p.tile_index == 0)
+    assert page0.focus == 5
+    assert page0.n_chunks == 3
 
 
 def test_fuse_ties_on_norm_keep_the_first_variant():
     """Both variants ranked it first, so both norms are 1.0. The question as
     asked is variant 0 and wins the tie — deliberate, not incidental."""
-    asked = [{"article_id": 0, "tile_index": 0, "score": 0.5, "chunks": [],
-              "focus": 1, "n_chunks": 1}]
-    phrase = [{"article_id": 0, "tile_index": 0, "score": 0.9, "chunks": [],
-               "focus": 5, "n_chunks": 3}]
-    assert retrieve.fuse([asked, phrase])[0]["focus"] == 1
+    asked = [page(0, score=0.5, focus=1)]
+    phrase = [page(0, score=0.9, focus=5)]
+    assert retrieve.fuse([asked, phrase])[0].focus == 1
 
 
 def test_fuse_admits_pages_found_by_only_one_variant():
     """Where the recall gain comes from."""
-    a = [{"article_id": 0, "tile_index": 0, "score": 0.9, "chunks": [],
-          "focus": 1, "n_chunks": 1}]
-    b = [{"article_id": 0, "tile_index": 7, "score": 0.4, "chunks": [],
-          "focus": 1, "n_chunks": 1}]
-    assert {p["tile_index"] for p in retrieve.fuse([a, b])} == {0, 7}
+    a = [page(0, score=0.9, focus=1)]
+    b = [page(7, score=0.4, focus=1)]
+    assert {p.tile_index for p in retrieve.fuse([a, b])} == {0, 7}
 
 
 # -- hybrid RRF -------------------------------------------------------------
 
 def test_rrf_scores_by_rank_not_magnitude():
-    visual = [{"article_id": 0, "tile_index": 0, "score": 0.42, "source": "visual"},
-              {"article_id": 0, "tile_index": 1, "score": 0.41, "source": "visual"}]
-    lex = [{"article_id": 0, "tile_index": 1, "score": 8.0, "source": "lexical"}]
+    visual = [page(0, score=0.42), page(1, score=0.41)]
+    lex = [page(1, score=8.0, source=pagehit.LEXICAL)]
     out = retrieve.rrf([visual, lex])
     k = retrieve.RRF_K
     top = out[0]
-    assert top["tile_index"] == 1                # agreed on by both retrievers
-    assert top["rrf"] == pytest.approx(1 / (k + 2) + 1 / (k + 1))
+    assert top.tile_index == 1                # agreed on by both retrievers
+    assert top.rrf == pytest.approx(1 / (k + 2) + 1 / (k + 1))
 
 
 def test_rrf_records_provenance():
-    visual = [{"article_id": 0, "tile_index": 0, "score": 0.4, "source": "visual"}]
-    lex = [{"article_id": 0, "tile_index": 0, "score": 8.0, "source": "lexical"}]
+    visual = [page(0, score=0.4)]
+    lex = [page(0, score=8.0, source=pagehit.LEXICAL)]
     out = retrieve.rrf([visual, lex])
-    assert sorted(out[0]["found_by"]) == ["lexical", "visual"]
+    assert sorted(out[0].sources) == ["lexical", "visual"]
 
 
 def test_rrf_keeps_whichever_list_carried_geometry():
     """A text-only hit has no region to box; the visual list's chunks must win."""
-    visual = [{"article_id": 0, "tile_index": 0, "score": 0.4, "source": "visual",
-               "chunks": [{"c": 1}], "focus": 3, "n_chunks": 2}]
-    lex = [{"article_id": 0, "tile_index": 0, "score": 8.0, "source": "lexical",
-            "chunks": [], "focus": None, "n_chunks": 0}]
-    assert retrieve.rrf([lex, visual])[0]["focus"] == 3
+    visual = [page(0, score=0.4, focus=3)]
+    lex = [page(0, score=8.0, source=pagehit.LEXICAL)]
+    assert retrieve.rrf([lex, visual])[0].focus == 3
 
 
 def test_rrf_weight_shifts_the_lexical_vote():
-    visual = [{"article_id": 0, "tile_index": 0, "score": 0.4, "source": "visual"}]
-    lex = [{"article_id": 0, "tile_index": 1, "score": 8.0, "source": "lexical"}]
-    assert retrieve.rrf([visual, lex], weights=[1.0, 0.0])[0]["tile_index"] == 0
-    assert retrieve.rrf([visual, lex], weights=[0.0, 1.0])[0]["tile_index"] == 1
+    visual = [page(0, score=0.4)]
+    lex = [page(1, score=8.0, source=pagehit.LEXICAL)]
+    assert retrieve.rrf([visual, lex], weights=[1.0, 0.0])[0].tile_index == 0
+    assert retrieve.rrf([visual, lex], weights=[0.0, 1.0])[0].tile_index == 1
 
 
 # -- the whole pipeline, with retrievers injected ---------------------------
@@ -178,7 +185,7 @@ def test_retrieve_pages_visual_only(scale_of, hits):
     pages, debug = retrieve.retrieve_pages(
         fake_search, "Ile kosztuje dzielony wał?", scale_of, n_pages=2)
     assert len(calls) == 2                       # question + noun phrase
-    assert [p["page"] for p in pages] == [1, 2]
+    assert [p.page for p in pages] == [1, 2]
     assert [d["retriever"] for d in debug] == ["visual", "visual"]
 
 
@@ -196,7 +203,7 @@ def test_retrieve_pages_hybrid_fuses_the_text_layer(scale_of, hits):
     pages, debug = retrieve.retrieve_pages(
         lambda q, n: hits((0, 0, 1, 0.9)), "dzielony wał", scale_of,
         n_pages=2, lexical_fn=fake_lex)
-    assert {p["page"] for p in pages} == {1, 2}
+    assert {p.page for p in pages} == {1, 2}
     assert debug[-1]["retriever"] == "lexical"
 
 

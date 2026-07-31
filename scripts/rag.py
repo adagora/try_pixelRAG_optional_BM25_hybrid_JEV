@@ -27,6 +27,7 @@ import chunkmeta
 import encoder_device
 import imagefit
 import layout
+import pagehit
 
 # One connection pool for the process. A search makes at least two HTTP calls
 # (encode, then /search) and each used to open, use and discard its own socket:
@@ -853,6 +854,31 @@ def _scale_of(article_id: int, tile_index: int, chunk_index: int) -> str:
     return chunkmeta.scale_of(article_id, tile_index, chunk_index, LAYOUT)
 
 
+def _hit_row(p: pagehit.PageHit) -> dict:
+    """What every retrieved-page payload says about a page.
+
+    `score` is whichever number ORDERS the list — the fused RRF score under
+    hybrid, the aggregated cosine otherwise — and `raw_score` is always the
+    retriever's own. They are separate keys because they are not comparable:
+    visual scores are cosines in a 0.3-0.7 band and BM25 scores are unbounded
+    near 8, so putting both in one column invites reading a text hit as ten
+    times more confident than a pixel hit. `found_by` says which produced it.
+
+    The matched region is NOT here: the search event calls it `region` and the
+    tile event calls it `chunk_index`, and each adds its own name rather than
+    shipping both for one value.
+    """
+    return {
+        "article_id": p.article_id,
+        "document": doc_title(p.article_id),
+        "page": p.page,
+        "score": round(p.ranking_score, 5),
+        "raw_score": round(p.score, 4),
+        "found_by": p.found_by,
+        "n_chunks": p.n_chunks,
+    }
+
+
 def _oneshot_pages(question: str, emit, provider: str,
                    n_pages: int = ONESHOT_PAGES) -> list[dict]:
     """Hybrid search → best whole pages (retrieve, fuse, read pages).
@@ -875,66 +901,43 @@ def _oneshot_pages(question: str, emit, provider: str,
         search, question, _scale_of, n_pages=n_pages,
         per_query=_per_query(n_pages), lexical_fn=_lexical_fn())
 
-    # `score` is only comparable within one retriever: visual scores are cosines
-    # in a 0.3-0.7 band, BM25 scores are unbounded and land near 8. Showing them
-    # in one column invites reading a text hit as ten times more confident than a
-    # pixel hit. The fused rank score is the only number that orders this list, so
-    # that is what gets reported, with provenance next to it.
-    def _prov(p: dict) -> str:
-        by = set(p.get("found_by") or ["visual"])
-        return "both" if len(by) > 1 else next(iter(by))
-
     emit({"type": "search", "query": question, "variants": debug,
-          "hits": [{
-              "article_id": p["article_id"],
-              "document": doc_title(p["article_id"]),
-              "page": p["page"],
-              "region": p["focus"],
-              "score": round(p.get("rrf", p["score"]), 5),
-              "raw_score": round(p["score"], 4),
-              "found_by": _prov(p),
-              "n_chunks": p["n_chunks"],
-          } for p in pages_ranked]})
+          "hits": [{**_hit_row(p), "region": p.focus} for p in pages_ranked]})
 
     pages: list[dict] = []
     for p in pages_ranked:
-        path = page_path(p["article_id"], p["tile_index"])
+        path = page_path(p.article_id, p.tile_index)
         if not path.exists():
             continue
-        pw, ph = page_size(p["article_id"], p["tile_index"])
+        pw, ph = page_size(p.article_id, p.tile_index)
         # Highlight the strongest *region* chunk. The gist chunk covers the whole
         # page, so boxing it would mark everything and mean nothing.
-        box = (box_pct(p["article_id"], p["tile_index"], p["focus"])
-               if p["focus"] is not None else None)
+        box = (box_pct(p.article_id, p.tile_index, p.focus)
+               if p.focus is not None else None)
         # Sized for whoever is about to read it. The rendered page is 200 DPI;
         # every provider bills a smaller number than that, and Gemini's is a
         # step function with a cliff just below A4 — see imagefit.
         img, mime = imagefit.fit(path, provider)
-        page = {
-            "article_id": p["article_id"],
-            "document": doc_title(p["article_id"]),
-            "page": p["page"],
-            "tile_index": p["tile_index"],
-            "chunk_index": p["focus"],
+
+        # The wire contract, stated once. Consumers: ask.py's trace printer and
+        # index.html's SSE handler. It carries no image bytes — the UI fetches
+        # the page from /api/page, and base64ing a JPEG into an SSE frame would
+        # put every retrieved page on the wire twice.
+        event = {
+            **_hit_row(p),
+            "tile_index": p.tile_index,
+            "chunk_index": p.focus,
             "box": box,
-            "score": round(p.get("rrf", p["score"]), 5),
-            "raw_score": round(p["score"], 4),
-            "found_by": _prov(p),
-            "n_chunks": p["n_chunks"],
             # Geometry stays in ORIGINAL page pixels: box_pct and the UI's
             # highlight overlays are percentages of the rendered page, and the
             # reader's downscale must not leak into them.
             "page_w": pw,
             "page_h": ph,
-            "image": img,
-            "mime": mime,
-            "label": f"{doc_title(p['article_id'])} — strona {p['page']}",
         }
-        emit({"type": "tile", **{k: page[k] for k in (
-            "article_id", "document", "page", "tile_index", "chunk_index",
-            "box", "page_w", "page_h", "score", "raw_score", "found_by",
-            "n_chunks")}})
-        pages.append(page)
+        emit({"type": "tile", **event})
+        # What the reader gets, which is the event plus the pixels themselves.
+        pages.append({**event, "image": img, "mime": mime,
+                      "label": f"{doc_title(p.article_id)} — strona {p.page}"})
     return pages
 
 

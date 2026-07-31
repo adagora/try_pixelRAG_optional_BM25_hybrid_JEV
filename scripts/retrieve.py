@@ -40,6 +40,9 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+import pagehit
+from pagehit import Chunk, PageHit
+
 # (article_id, tile_index, chunk_index) -> "page" | "region". See chunkmeta.
 ScaleFn = Callable[[int, int, int], str]
 
@@ -101,7 +104,7 @@ def query_variants(q: str) -> list[str]:
     return out
 
 
-def aggregate(hits: list[dict], scale_of: ScaleFn) -> list[dict]:
+def aggregate(hits: list[dict], scale_of: ScaleFn) -> list[PageHit]:
     """Chunk hits -> page-scored candidates, best first.
 
     Each candidate keeps the chunks that put it there, so the caller can show
@@ -111,37 +114,29 @@ def aggregate(hits: list[dict], scale_of: ScaleFn) -> list[dict]:
     Injected rather than read off disk: this module is the ranking policy and
     the manifest that answers the question belongs to the index — see chunkmeta.
     """
-    pages: dict[tuple[int, int], dict] = {}
+    by_page: dict[tuple[int, int], list[Chunk]] = {}
     for h in hits:
         aid, ti = h["article_id"], h["tile_index"]
         scale = scale_of(aid, ti, h["chunk_index"])
-        s = h["score"] * (GIST_BONUS if scale == "page" else 1.0)
-        p = pages.setdefault((aid, ti), {
-            "article_id": aid, "tile_index": ti, "page": ti + 1,
-            "chunks": [], "best": 0.0,
-        })
-        p["chunks"].append({
-            "chunk_index": h["chunk_index"], "score": h["score"],
-            "weighted": s, "scale": scale,
-        })
-        p["best"] = max(p["best"], s)
+        weighted = h["score"] * (GIST_BONUS if scale == "page" else 1.0)
+        by_page.setdefault((aid, ti), []).append(
+            Chunk(chunk_index=h["chunk_index"], score=h["score"],
+                  weighted=weighted, scale=scale))
 
     out = []
-    for p in pages.values():
-        p["chunks"].sort(key=lambda c: -c["weighted"])
-        rest = sum(c["weighted"] for c in p["chunks"][1:])
-        p["score"] = p["best"] + AGREEMENT * rest
-        p["n_chunks"] = len(p["chunks"])
-        # The best *region* is what a highlight should box: the gist chunk spans
-        # the whole page, so drawing it tells the user nothing.
-        regions = [c for c in p["chunks"] if c["scale"] == "region"]
-        p["focus"] = regions[0]["chunk_index"] if regions else None
-        out.append(p)
-    out.sort(key=lambda p: -p["score"])
+    for (aid, ti), chunks in by_page.items():
+        chunks.sort(key=lambda c: -c.weighted)
+        # Best chunk carries the page; the rest contribute a decaying bonus, so
+        # agreement counts without letting four half-matches beat one clean hit.
+        rest = sum(c.weighted for c in chunks[1:])
+        out.append(PageHit(article_id=aid, tile_index=ti,
+                           score=chunks[0].weighted + AGREEMENT * rest,
+                           chunks=tuple(chunks)))
+    out.sort(key=lambda p: -p.score)
     return out
 
 
-def fuse(rankings: list[list[dict]]) -> list[dict]:
+def fuse(rankings: list[list[PageHit]]) -> list[PageHit]:
     """Fuse per-variant page rankings by best normalised score.
 
     RRF was the first thing tried here and it is the wrong tool for this case.
@@ -157,27 +152,20 @@ def fuse(rankings: list[list[dict]]) -> list[dict]:
     ordering that strength of evidence implies. A page found by only one variant
     still enters the candidate set, which is where the recall gain came from.
     """
+    merged: dict[tuple[int, int], PageHit] = {}
     for ranking in rankings:
-        top = max((p["score"] for p in ranking), default=0.0) or 1.0
+        top = max((p.score for p in ranking), default=0.0) or 1.0
         for i, p in enumerate(ranking):
-            p["norm"] = p["score"] / top
-            p["rank"] = i
-
-    merged: dict[tuple[int, int], dict] = {}
-    for ranking in rankings:
-        for p in ranking:
-            key = (p["article_id"], p["tile_index"])
-            cur = merged.get(key)
-            if cur is None:
-                merged[key] = {**p}
-                continue
-            if p["norm"] > cur["norm"]:
-                # Keep the strongest evidence, and the chunk list that produced
-                # it — the focus region drives the highlight box.
-                cur.update(norm=p["norm"], score=p["score"], chunks=p["chunks"],
-                           focus=p["focus"], n_chunks=p["n_chunks"])
-    out = list(merged.values())
-    out.sort(key=lambda p: -p["norm"])
+            scored = p.with_(norm=p.score / top, rank=i)
+            cur = merged.get(scored.key)
+            # Strictly greater, so a tie keeps the earlier variant — variant 0
+            # is the question as asked, and that is the ranking to prefer.
+            if cur is None or scored.norm > cur.norm:
+                # The whole record moves together: keeping the strongest
+                # evidence means keeping the chunk list that produced it, and
+                # the focus region that drives the highlight box comes from it.
+                merged[scored.key] = scored
+    out = sorted(merged.values(), key=lambda p: -p.norm)
     return out
 
 
@@ -210,8 +198,8 @@ LEX_WEIGHT = 1.0
 FUSE_DEPTH = 20
 
 
-def rrf(rankings: list[list[dict]], weights: list[float] | None = None,
-        k: int = RRF_K) -> list[dict]:
+def rrf(rankings: list[list[PageHit]], weights: list[float] | None = None,
+        k: int = RRF_K) -> list[PageHit]:
     """Reciprocal-rank fusion across retrievers with incomparable scores.
 
     Each list contributes weight/(k + rank) to every page it returns. k=60 is
@@ -220,43 +208,29 @@ def rrf(rankings: list[list[dict]], weights: list[float] | None = None,
     outvote agreement further down.
     """
     weights = weights or [1.0] * len(rankings)
-    merged: dict[tuple[int, int], dict] = {}
+    merged: dict[tuple[int, int], PageHit] = {}
     for w, ranking in zip(weights, rankings):
         for i, p in enumerate(ranking):
-            key = (p["article_id"], p["tile_index"])
-            cur = merged.get(key)
+            cur = merged.get(p.key)
             if cur is None:
-                cur = merged[key] = {**p, "rrf": 0.0, "found_by": []}
-            cur["rrf"] += w / (k + i + 1)
-            cur["found_by"].append(p.get("source", "visual"))
-            # Keep whichever list carried chunk geometry. A page the text index
-            # found alone has no region to box, and citations.py already falls
-            # back to page-level highlighting for exactly that case.
-            if p.get("chunks") and not cur.get("chunks"):
-                cur.update(chunks=p["chunks"], focus=p.get("focus"),
-                           n_chunks=p.get("n_chunks", 0))
-    out = list(merged.values())
-    out.sort(key=lambda p: -p["rrf"])
-    return out
-
-
-def _lexical_as_pages(hits: list[dict]) -> list[dict]:
-    """BM25 hits -> the page shape the rest of the pipeline expects.
-
-    tile_index is page-1 by the same convention chunk_multiscale.py writes, so a
-    text-only hit still resolves to a rendered page image for the reader.
-    """
-    return [{
-        "article_id": h["article_id"], "tile_index": h["page"] - 1,
-        "page": h["page"], "score": h["score"], "norm": 0.0,
-        "chunks": [], "focus": None, "n_chunks": 0, "source": "lexical",
-    } for h in hits]
+                merged[p.key] = p.with_(rrf=w / (k + i + 1))
+                continue
+            merged[p.key] = cur.with_(
+                rrf=cur.rrf + w / (k + i + 1),
+                sources=cur.sources | p.sources,
+                # Keep whichever list carried chunk geometry. A page the text
+                # index found alone has no region to box, and citations.py
+                # already falls back to page-level highlighting for that case.
+                chunks=cur.chunks or p.chunks,
+            )
+    return sorted(merged.values(), key=lambda p: -p.rrf)
 
 
 def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
                    n_pages: int = 4, per_query: int = 24,
                    lexical_fn=None, lex_weight: float = LEX_WEIGHT,
-                   fuse_depth: int = FUSE_DEPTH) -> tuple[list[dict], list[dict]]:
+                   fuse_depth: int = FUSE_DEPTH
+                   ) -> tuple[list[PageHit], list[dict]]:
     """Full retrieval: variants -> chunk search -> page aggregate -> fuse.
 
     `search_fn(query, n_results)` is injected rather than imported so this stays
@@ -292,21 +266,24 @@ def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
     for v, hits in zip(variants, hit_lists):
         ranked = aggregate(hits, scale_of)
         rankings.append(ranked)
-        debug.append({
-            "query": v, "retriever": "visual",
-            "top": [{"article_id": p["article_id"], "page": p["page"],
-                     "score": round(p["score"], 4), "n_chunks": p["n_chunks"]}
-                    for p in ranked[:5]],
-        })
+        debug.append(_debug_row(v, "visual", ranked))
     visual = fuse(rankings)
     if lexical_fn is None:
         return visual[:n_pages], debug
 
-    lex = _lexical_as_pages(lexical_fn(question, fuse_depth))
-    debug.append({
-        "query": question, "retriever": "lexical",
-        "top": [{"article_id": p["article_id"], "page": p["page"],
-                 "score": round(p["score"], 4), "n_chunks": 0} for p in lex[:5]],
-    })
+    lex = [pagehit.from_lexical(h) for h in lexical_fn(question, fuse_depth)]
+    debug.append(_debug_row(question, "lexical", lex))
     fused = rrf([visual[:fuse_depth], lex], weights=[1.0, lex_weight])
     return fused[:n_pages], debug
+
+
+def _debug_row(query: str, retriever: str, ranked: list[PageHit]) -> dict:
+    """What one retriever saw, for the UI's search trace. `score` here is that
+    retriever's own number — see PageHit on why it is not comparable across
+    retrievers, and why the fused list reports ranking_score instead."""
+    return {
+        "query": query, "retriever": retriever,
+        "top": [{"article_id": p.article_id, "page": p.page,
+                 "score": round(p.score, 4), "n_chunks": p.n_chunks}
+                for p in ranked[:5]],
+    }
