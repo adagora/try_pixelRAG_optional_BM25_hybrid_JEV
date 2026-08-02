@@ -65,7 +65,9 @@ KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 .venv/bin/pixelrag serve \
 | `PIXELRAG_PROVIDER` | auto | force `gemini` \| `anthropic` |
 | `ANTHROPIC_EFFORT` | `medium` | thinking depth for the read; empty = API default |
 | `PIXELRAG_ANSWER_CACHE` | `1` | reuse answers for near-identical questions |
-| `PIXELRAG_CACHE_THRESHOLD` | `0.97` | cosine cut for a cache hit |
+| `PIXELRAG_CACHE_THRESHOLD` | `0.95` | cosine cut for a cache hit |
+| `PIXELRAG_LOG` | `warning` | `debug`\|`info`\|`warning`\|`error` — see "When it degrades" |
+| `PIXELRAG_INDEX_DIR` | `./index` | index tree; relative paths resolve against the repo root |
 | `PIXELRAG_IMAGE_FIT` | `1` | downscale pages to the reader's billed resolution |
 | `PIXELRAG_IMAGE_FLOOR` | `0.85` | how much shrink `imagefit` may spend chasing a cheaper tile grid |
 | `PIXELRAG_ANTHROPIC_LONG_EDGE` | `1568` | Anthropic tier to target; `2576` sends high-res |
@@ -125,14 +127,49 @@ better when PDFs have a text layer; turn it on with `PIXELRAG_HYBRID=1`.
 |---|---|
 | `pdfs/` | source documents |
 | `index/` | tiles, vectors, `text.json` |
-| `scripts/rag.py` | retrieve + reader (shared by CLI/UI) |
-| `scripts/retrieve.py` | chunk→page aggregation, RRF hybrid |
+| `scripts/rag.py` | orchestration: retrieve → read → cite (shared by CLI/UI) |
+| `scripts/providers.py` | the model backends behind one `Reader` interface |
+| `scripts/retrieve.py` | chunk→page aggregation, RRF hybrid — pure, no IO |
+| `scripts/pagehit.py` | the retrieved-page record, shared by all three layers |
+| `scripts/layout.py` | where the index is on disk, and how it is named |
+| `scripts/chunkmeta.py` | chunk geometry and scale, read once |
 | `scripts/imagefit.py` | downscale pages to what the reader actually bills |
 | `scripts/answer_cache.py` | reuse answers for near-identical questions |
 | `scripts/lexical.py` | BM25 over PDF text |
 | `scripts/citations.py` | quote → highlight rectangles |
+| `scripts/snip.py` | crop a page around a citation, for chat inline |
 | `scripts/app.py` + `static/` | web UI |
+| `tests/` | the pure logic, runnable with no services and no API key |
 | `eval/` | place for a fresh question set when you rebuild one |
 
 `scripts/evaluate.py` / `evaluate_pl.py` / `answer_all.py` expect YAML under
 `eval/` — add questions there when you want measured recall again.
+
+## Tests
+
+```bash
+uv pip install --python .venv/bin/python pytest
+.venv/bin/python -m pytest
+```
+
+No search service, no encoder, no API key, no network. The answer pipeline runs
+end to end against a `FakeReader` (see `tests/conftest.py`), so prompt assembly,
+streaming, citations, cost and the answer cache are all covered without paying
+for a read.
+
+## When it degrades
+
+The system falls back rather than failing — six times over. Each fallback is
+correct and each one now says so:
+
+| Symptom | What you get |
+|---|---|
+| encoder sidecar down | model loads in-process; first query pays ~30s (`INFO`) |
+| local encode fails | server-side encoding, ~7x slower (`WARNING`) |
+| question can't be embedded | answer cache off for that query (`WARNING`) |
+| `PIXELRAG_HYBRID=1`, no `text.json` | answers visual-only (`WARNING`) |
+| page can't be resized | sent at full resolution, billed accordingly (`WARNING`) |
+| citations can't be resolved | answer stands, no highlights (`WARNING`) |
+
+`PIXELRAG_LOG=info` or `scripts/ask.py --log info` to see them; the CLI sends
+them to stderr so they never interleave with a streamed answer.
