@@ -229,7 +229,7 @@ def rrf(rankings: list[list[PageHit]], weights: list[float] | None = None,
 def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
                    n_pages: int = 4, per_query: int = 24,
                    lexical_fn=None, lex_weight: float = LEX_WEIGHT,
-                   fuse_depth: int = FUSE_DEPTH
+                   fuse_depth: int = FUSE_DEPTH, variants_fn=None
                    ) -> tuple[list[PageHit], list[dict]]:
     """Full retrieval: variants -> chunk search -> page aggregate -> fuse.
 
@@ -243,9 +243,13 @@ def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
     same way keeps the text layer a caller's choice, not a hard dependency: a
     corpus of scans has no text layer to fuse and should not pay for the import.
 
+    `variants_fn(question)` replaces the phrasings this module would search.
+    A retriever that expands the query itself — Jev does — passes `[question]`
+    so the question is not fanned out twice and fused against itself.
+
     Returns (top pages, per-retriever debug rows).
     """
-    variants = query_variants(question)
+    variants = (variants_fn or query_variants)(question)
 
     # Concurrently, because the two phrasings are independent and each costs an
     # encode: sequentially that is ~2x140ms of pure wall clock on the critical
@@ -280,9 +284,16 @@ def retrieve_pages(search_fn, question: str, scale_of: ScaleFn,
 def _debug_row(query: str, retriever: str, ranked: list[PageHit]) -> dict:
     """What one retriever saw, for the UI's search trace. `score` here is that
     retriever's own number — see PageHit on why it is not comparable across
-    retrievers, and why the fused list reports ranking_score instead."""
+    retrievers, and why the fused list reports ranking_score instead.
+
+    `pages` and `chunks` are the whole candidate list, not the five shown: the
+    comparison UI reports the funnel, and "top 5 of 19 pages built from 47
+    chunks" and "top 5 of 5" are the same five rows and very different searches.
+    """
     return {
         "query": query, "retriever": retriever,
+        "pages": len(ranked),
+        "chunks": sum(p.n_chunks for p in ranked),
         "top": [{"article_id": p.article_id, "page": p.page,
                  "score": round(p.score, 4), "n_chunks": p.n_chunks}
                 for p in ranked[:5]],

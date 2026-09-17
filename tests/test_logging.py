@@ -46,7 +46,7 @@ def test_falling_back_to_server_side_encoding_is_reported(monkeypatch, caplog):
 def test_a_disabled_answer_cache_is_reported(monkeypatch, caplog, tmp_path):
     monkeypatch.setattr(rag, "embed_query",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
-    monkeypatch.setattr(rag, "_oneshot_pages", lambda *a, **k: [])
+    monkeypatch.setattr(rag, "_oneshot_pages", lambda *a, **k: ([], {}))
     monkeypatch.setattr(rag.providers, "reader_for",
                         lambda provider=None, api_key=None: _NullReader())
     rag.run_agent("q")

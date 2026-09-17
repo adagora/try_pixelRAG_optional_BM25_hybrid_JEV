@@ -71,7 +71,7 @@ def _baseline(question: str, k: int, depth: int | None = None) -> list[tuple[int
     method being tested. `--ab` therefore runs this at both depths.
     """
     pages, seen = [], set()
-    for h in rag.search(question, n_results=depth or max(k * 3, 12)):
+    for h in rag.searcher("visual")(question, depth or max(k * 3, 12)):
         key = (h["article_id"], h["tile_index"] + 1)
         if key in seen:
             continue
@@ -83,8 +83,11 @@ def _baseline(question: str, k: int, depth: int | None = None) -> list[tuple[int
 
 
 def _improved(question: str, k: int) -> list[tuple[int, int]]:
+    # `rag.searcher("visual")`, not `rag.search`: the latter follows whatever
+    # PIXELRAG_JEV/PIXELRAG_HYBRID are set to, and a strategy in this file has
+    # to be the strategy it is named after or the table means nothing.
     ranked, _ = retrieve.retrieve_pages(
-        rag.search, question, rag._scale_of, n_pages=k,
+        rag.searcher("visual"), question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k))
     return [(p.article_id, p.page) for p in ranked]
 
@@ -121,9 +124,25 @@ def _hybrid(question: str, k: int, w: float = retrieve.LEX_WEIGHT
     import lexical
 
     ranked, _ = retrieve.retrieve_pages(
-        rag.search, question, rag._scale_of, n_pages=k,
+        rag.searcher("visual"), question, rag._scale_of, n_pages=k,
         per_query=rag._per_query(k),
         lexical_fn=lexical.search_text, lex_weight=w)
+    return [(p.article_id, p.page) for p in ranked]
+
+
+def _jev(question: str, k: int, mode: str = "jev") -> list[tuple[int, int]]:
+    """A Jev mode, scored like any other strategy. COSTS MONEY — see --jev.
+
+    Every other strategy in this file is local CPU, so the whole eval could be
+    re-run on a whim. These are not: `jev-expand` spends one TypeSafe call per
+    question and `jev` spends two, the second carrying the whole candidate pool
+    as text. That is the only reason they are behind a flag rather than in the
+    default run — not because they are less interesting, but because a sweep
+    that silently bills per question is a trap.
+
+    Goes through rag.retrieve_for, which is the same call the app answers with.
+    """
+    ranked, _, _ = rag.retrieve_for(question, mode, n_pages=k)
     return [(p.article_id, p.page) for p in ranked]
 
 
@@ -246,6 +265,11 @@ def main() -> None:
                          "union that bounds what fusion could ever reach")
     ap.add_argument("--sweep", action="store_true",
                     help="sweep the lexical weight in the hybrid fusion")
+    ap.add_argument("--jev", action="store_true",
+                    help="also run the Jev modes. COSTS MONEY: one TypeSafe "
+                         "call per question for jev-expand, two for jev — the "
+                         "second carries the candidate pool as text. Run it to "
+                         "decide whether the reranker earns that bill")
     ap.add_argument("-q", "--quiet", action="store_true", help="totals only")
     args = ap.parse_args()
 
@@ -263,7 +287,7 @@ def main() -> None:
                  f"rebuild the index before trusting any number here.")
 
     try:
-        rag.search("rozgrzewka", n_results=1)
+        rag.searcher("visual")("rozgrzewka", 1)
     except Exception as e:
         sys.exit(f"Search API unreachable on {rag.SEARCH_API}: {e}\n"
                  f"Start it first (see README).")
@@ -292,6 +316,16 @@ def main() -> None:
         for w in (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0):
             r = run(qs, args.k, lambda q, k, w=w: _hybrid(q, k, w), t2i)
             print(f"  {w:5.2f}  {r['top1']:3d}/{r['n']:<3d}  {r['recall']:5d}/{r['n']:<3d}")
+
+    if args.jev:
+        for mode in ("jev-expand", "jev", "jev+hybrid"):
+            blocked = rag.retrieval_blocked(mode)
+            if blocked:
+                print(f"\n(skipped {mode}: {blocked})")
+                continue
+            show(f"{mode} (rag.retrieve_for — the path the app answers with)",
+                 run(qs, args.k, lambda q, k, m=mode: _jev(q, k, m), t2i),
+                 args.k, t2i, not args.quiet)
 
     if args.hybrid:
         show(f"HYBRID: visual + lexical, RRF (lex_weight={retrieve.LEX_WEIGHT})",

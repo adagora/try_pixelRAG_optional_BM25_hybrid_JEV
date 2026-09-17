@@ -104,6 +104,50 @@
     color:#fff; font:600 14px/1 inherit; cursor:pointer; }
   button.go:disabled { opacity:.5; cursor:default; }
 
+  /* ---------------- retrieval comparison ---------------- */
+  /* One card per mode, stacked — not a wide table. The chat column is the
+     narrow half of the layout, and four modes across eight numbers does not
+     fit in it at any font size worth reading. */
+  .cmp { display:flex; flex-direction:column; gap:8px; margin:2px 0 6px; }
+  .mode { border:1px solid var(--line); border-radius:var(--r); background:var(--panel);
+          padding:9px 11px; }
+  .mode.bad { opacity:.7; }
+  .mode .hd { display:flex; align-items:baseline; gap:8px; }
+  .mode .nm { font:700 12.5px/1.4 ui-monospace,Menlo,monospace; }
+  .mode .ms { margin-left:auto; font:700 12.5px/1.4 ui-monospace,Menlo,monospace;
+              color:var(--accent); }
+  .tag { font:600 10px/1.7 ui-monospace,Menlo,monospace; padding:0 5px; border-radius:4px;
+         border:1px solid var(--line); color:var(--muted); }
+  .tag.on { border-color:var(--accent); color:var(--accent); background:var(--soft); }
+  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(74px,1fr));
+           gap:5px 10px; margin-top:8px; }
+  .fact b { display:block; font:700 13px/1.35 ui-monospace,Menlo,monospace; }
+  .fact span { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .pgs { display:flex; flex-wrap:wrap; gap:4px; margin-top:9px; }
+  .pg-chip { border:1px solid var(--line); border-radius:6px; padding:1px 7px; background:var(--bg);
+             color:var(--ink); font:600 11.5px/1.75 ui-monospace,Menlo,monospace; cursor:pointer; }
+  .pg-chip:hover { border-color:var(--accent); color:var(--accent); }
+  /* Dashed = only this mode returned that page. The whole reason to run the
+     comparison is to see where the modes disagree, so mark it on the page. */
+  .pg-chip.solo { border-style:dashed; color:var(--muted); }
+  .mini { padding:3px 9px; border:1px solid var(--line); background:var(--bg); color:var(--ink);
+          border-radius:6px; font:600 11.5px/1.5 inherit; cursor:pointer; margin-top:9px; }
+  .mini:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .mini:disabled { opacity:.5; cursor:default; }
+  .note { color:var(--warn); font-size:11.5px; margin-top:6px; }
+  .dim { color:var(--muted); }
+
+  /* Details panel — the numbers behind the summary, collapsed by default. */
+  .det { margin-top:8px; }
+  .det > summary { cursor:pointer; font-size:11.5px; color:var(--muted); }
+  .det > summary:hover { color:var(--accent); }
+  .det table { border-collapse:collapse; width:100%; margin:6px 0 2px; }
+  .det td { padding:1px 8px 1px 0; vertical-align:top;
+            font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .det td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
+  .det h5 { margin:9px 0 0; font:600 11px/1.5 inherit; color:var(--muted);
+            text-transform:uppercase; letter-spacing:.04em; }
+
   /* ---------------- pdf viewer ---------------- */
   #viewer { display:flex; flex-direction:column; min-height:0; min-width:0; }
   .vbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
@@ -210,6 +254,12 @@
       <input id="apiKey" type="password" autocomplete="off" spellcheck="false"
              placeholder="opcjonalnie — nadpisuje zmienną środowiskową">
     </label>
+    <label class="keybar">
+      <span class="sub">wyszukiwanie</span>
+      <select id="mode" title="tryb wyszukiwania użyty do odpowiedzi"></select>
+    </label>
+    <label class="chk"><input type="checkbox" id="cmp"
+      title="porównaj tryby wyszukiwania — samo wyszukiwanie, bez czytnika"> porównaj tryby</label>
     <label class="chk"><input type="checkbox" id="chunks"> regiony PixelRAG</label>
   </div>
 </header>
@@ -221,7 +271,7 @@
     </div>
     <form id="form">
       <input id="q" type="text" autocomplete="off" required
-             placeholder="np. Ile kosztuje brama ręczna SNP 2500x2100 RAL 7016">
+             placeholder="np. Jakie są opcje napędu do bramy roletowej BR-77">
       <button class="go" id="send">Zapytaj</button>
     </form>
   </section>
@@ -279,6 +329,8 @@ const prevPg = document.getElementById('prevPg');
 const nextPg = document.getElementById('nextPg');
 const zLbl = document.getElementById('zLbl');
 const openPdf = document.getElementById('openPdf');
+const modeEl = document.getElementById('mode');
+const cmpEl = document.getElementById('cmp');
 
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -685,12 +737,140 @@ function renderCitations(container, cites){
   markActiveCiteButton();
 }
 
-form.addEventListener('submit', async e => {
-  e.preventDefault();
-  const question = qEl.value.trim(); if (!question) return;
-  qEl.value = ''; sendEl.disabled = true;
+// ---------------------------------------------------------- retrieval modes
+// Retrieval is where an answer goes wrong first, and it is also what the cost
+// question is really about: the reader's bill is a function of how many pages
+// retrieval handed it. So the mode is pickable, and comparable — a comparison
+// run calls no reader at all, which is why four modes cost less than one answer.
+fetch('/api/modes').then(r => r.json()).then(d => {
+  const add = (value, label, blocked) => {
+    const o = document.createElement('option');
+    o.value = value; o.textContent = label;
+    if (blocked) { o.disabled = true; o.title = blocked; }
+    modeEl.appendChild(o);
+  };
+  modeEl.innerHTML = '';
+  add('auto', `auto — ${d.default}`, null);
+  // A blocked mode stays in the list, greyed out, with the reason on hover:
+  // "TYPESAFE_API_KEY is not set" is a setup instruction, and a mode that
+  // silently disappeared is a bug report nobody can file.
+  (d.modes || []).forEach(m =>
+    add(m.mode, m.blocked ? `${m.mode} — niedostępny` : m.mode, m.blocked));
+}).catch(() => {});
+
+const fmtMs = ms => ms == null ? '—'
+  : ms >= 1000 ? (ms / 1000).toFixed(1).replace('.', ',') + ' s' : Math.round(ms) + ' ms';
+const fmtTok = n => n >= 1000 ? (n / 1000).toFixed(1).replace('.', ',') + 'k' : String(n);
+
+// Retrieval money. '$0' means this mode calls no paid API at all; tokens mean
+// it does and nobody has told us the rate (TYPESAFE_PRICE_IN/OUT) — jev.price.
+function fmtCost(s){
+  const j = s && s.jev;
+  if (!j) return '$0';
+  if (j.cost_usd != null) return '$' + j.cost_usd.toFixed(4);
+  return fmtTok(j.input_tokens + j.output_tokens) + ' tok';
+}
+
+const pct = v => v == null ? '—' : Math.round(v * 100) + '%';
+
+function statsSummary(s){
+  if (!s) return '';
+  const bits = [`${s.pages} stron`, `${s.unique_chunks} chunków`, fmtMs(s.ms)];
+  if (s.reranker !== 'none') bits.splice(2, 0, 'rerank: ' + s.reranker);
+  if (s.answerable != null) bits.splice(1, 0, `w treści: ${pct(s.answerable)}`);
+  if (s.jev) bits.push(fmtCost(s));
+  return bits.join(' · ');
+}
+
+// Sorting always produces a rank 1, so no score can say "nothing here answers
+// it". This is the only field that does.
+function answerBadge(s){
+  if (!s || s.answerable == null) return '';
+  const v = s.answerable;
+  const label = v >= 0.7 ? 'jest w treści' : v >= 0.3 ? 'niepewne' : 'BRAK w treści';
+  return `<span class="tag${v >= 0.7 ? ' on' : ''}"`
+       + ` title="Jev: czy pobrane fragmenty zawierają odpowiedź">`
+       + `${label} ${pct(v)}</span>`;
+}
+
+const trow = (label, value) => `<tr><td>${esc(label)}</td><td>${value}</td></tr>`;
+
+// The numbers behind the summary. One function for the answer trace and for a
+// comparison row, because they are the same measurement of the same code.
+function statsDetails(s, variants){
+  if (!s) return '';
+  let html = '<table>'
+    + trow('tryb', esc(s.mode))
+    + trow('fuzja', esc(s.fusion))
+    + trow('reranker', esc(s.reranker))
+    + (s.answerable == null ? '' : trow('odpowiedź w treści',
+        `${pct(s.answerable)} <span class="dim">(Jev, niezależne od rankingu)</span>`))
+    + (s.best_score == null ? '' : trow('najlepszy chunk',
+        `${pct(s.best_score)} <span class="dim">rubryka 0-3, znormalizowana</span>`))
+    + trow('wektorowo', `${s.searches} zapytań → ${s.chunk_hits} trafień · `
+        + `${s.unique_chunks} unikalnych chunków · ${fmtMs(s.search_ms)} sumarycznie`)
+    + trow('BM25', s.lexical_calls
+        ? `${s.lexical_calls} zapytań → ${s.lexical_hits} stron · ${fmtMs(s.lexical_ms)}`
+        : '—')
+    + trow('lejek stron', `${s.candidate_pages} kandydujących → ${s.ranked_pages} `
+        + `po agregacji → ${s.pages} do czytnika`)
+    + trow('czas', `${fmtMs(s.ms)} zegara`)
+    + '</table>';
+  const j = s.jev;
+  if (j){
+    html += '<h5>jev</h5><table>'
+      + trow('model', esc(j.model))
+      + trow('warianty', j.variants.map(v => `<code>${esc(v)}</code>`).join('<br>') || '—')
+      + trow('aspekty', j.facets.map(f =>
+          `<span title="${esc(f.facet)}">${f.used ? '✓' : '·'} `
+          + `${esc(f.facet.split(' ')[0])} ${f.noul}</span>`).join('<br>') || '—')
+      + trow('kandydaci', `${j.candidates} unikalnych → ${j.scored} ocenionych`)
+      + trow('wywołania', j.calls.map(c =>
+          `${esc(c.kind)} · ${fmtMs(c.ms)} · ${c.input_tokens} in / ${c.output_tokens} out`
+        ).join('<br>') || '—')
+      + trow('razem', `${j.input_tokens} in / ${j.output_tokens} out · ${fmtCost(s)}`)
+      + trow('etapy', Object.entries(j.stages)
+          .map(([k, v]) => `${esc(k)} ${fmtMs(v)}`).join(' · ') || '—')
+      + '</table>';
+  }
+  if (variants && variants.length){
+    html += '<h5>listy retrieverów</h5><table>';
+    variants.forEach(v => {
+      const top = (v.top || []).map(t => `s.${t.page} (${t.score})`).join(', ');
+      html += trow(`${v.retriever} · ${v.query}`,
+        `${v.pages != null ? v.pages : '?'} stron / `
+        + `${v.chunks != null ? v.chunks : '?'} chunków`
+        + `<br><span class="dim">${esc(top)}</span>`);
+    });
+    html += '</table>';
+  }
+  return html;
+}
+
+// One SSE reader for both endpoints. They stream the same frame shape, and the
+// parse loop is not the interesting part of either.
+async function sse(url, body, onMessage){
+  const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'},
+                                 body: JSON.stringify(body) });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream:true });
+    let nl;
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, nl); buf = buf.slice(nl + 2);
+      if (raw.startsWith('data: ')) onMessage(JSON.parse(raw.slice(6)));
+    }
+  }
+}
+
+// ------------------------------------------------------------------ one ask
+async function ask(question, retrieval){
   resetSources();
-  addMsg('user', esc(question));
   const bot = addMsg('bot',
     `<div class="trace"></div><div class="body meta"><span class="spin"></span> szukam…</div>`);
   const traceEl = bot.querySelector('.trace');
@@ -707,32 +887,40 @@ form.addEventListener('submit', async e => {
 
   let streaming = false, streamBuf = '';
   try {
-    const res = await fetch('/api/ask', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ question, api_key: keyEl.value.trim() || null }),
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream:true });
-      let nl;
-      while ((nl = buf.indexOf('\n\n')) >= 0) {
-        const raw = buf.slice(0, nl); buf = buf.slice(nl + 2);
-        if (!raw.startsWith('data: ')) continue;
-        const { kind, payload } = JSON.parse(raw.slice(6));
-
+    await sse('/api/ask',
+      { question, api_key: keyEl.value.trim() || null, retrieval: retrieval || null },
+      ({ kind, payload }) => {
         if (kind === 'event') {
           if (payload.type === 'search') {
             const vs = (payload.variants || []).map(v => esc(v.query)).join(' · ');
-            step('⌕', `szukano: <code>${vs || esc(payload.query)}</code> — ${payload.hits.length} stron`);
+            const s = payload.stats;
+            step('⌕', `szukano: <code>${vs || esc(payload.query)}</code> — `
+                 + (s ? `<span class="dim">${esc(statsSummary(s))}</span>`
+                      : `${payload.hits.length} stron`));
+            if (s) {
+              const d = document.createElement('details');
+              d.className = 'det';
+              d.innerHTML = '<summary>szczegóły wyszukiwania</summary>'
+                            + statsDetails(s, payload.variants);
+              traceEl.appendChild(d);
+              // A degraded stage is a trace line, not a footnote: it is the
+              // difference between "Jev ranked this" and "Jev was billed and
+              // the original ranking stands".
+              (s.notes || []).forEach(n => step('!', `<span class="note">${esc(n)}</span>`));
+            }
           } else if (payload.type === 'tile') {
             notePage(payload);
             step('▣', `<code>${esc(payload.document)} s.${payload.page}</code>`,
                  [payload.article_id, payload.page]);
+          } else if (payload.type === 'answerable') {
+            const v = payload.value;
+            const word = v >= 0.7 ? 'jest' : v >= 0.3 ? 'niepewne' : 'BRAK';
+            step(v >= 0.3 ? '?' : '!',
+                 `odpowiedź w tych stronach: <b>${word} ${pct(v)}</b> `
+                 + `<span class="dim">· ${payload.pages} stron · ${fmtMs(payload.ms)}</span>`);
+          } else if (payload.type === 'refused') {
+            step('!', `<span class="note">Jev: odpowiedzi nie ma w pobranych `
+                 + `stronach (${pct(payload.answerable)}) — pominięto czytnik</span>`);
           } else if (payload.type === 'tile_error') {
             step('!', `<span class="err">brak regionu ${payload.tile_index}:${payload.chunk_index}</span>`);
           } else if (payload.type === 'answer_delta') {
@@ -757,27 +945,181 @@ form.addEventListener('submit', async e => {
           else if (V.aid != null) drawMarks();
           else vemptyEl.textContent = 'Ta odpowiedź nie wskazuje strony źródłowej.';
           const u = payload.usage || {};
+          const t = payload.timings || {};
           const cost = u.cost_usd != null ? ` · ~$${u.cost_usd.toFixed(3)}` : '';
           const cacheTok = u.cache_read ? ` · ${u.cache_read} cache-read` : '';
           const hit = payload.cached ? ' · z pamięci podręcznej' : '';
+          // Split, not summed: retrieval is the part the mode changes, and the
+          // first token is the part anyone actually feels.
+          const speed = [
+            t.retrieval_ms != null ? `wyszukiwanie ${fmtMs(t.retrieval_ms)}` : null,
+            t.gate_ms != null ? `bramka ${fmtMs(t.gate_ms)}` : null,
+            t.ttft_ms != null ? `1. token ${fmtMs(t.ttft_ms)}` : null,
+            t.total_ms != null ? `razem ${fmtMs(t.total_ms)}` : null,
+          ].filter(Boolean).join(' · ');
           const m = document.createElement('div');
           m.className = 'meta';
-          m.textContent = `${payload.provider}/${payload.model} · ${u.input||0} in / ${u.output||0} out${cacheTok}${cost}${hit}`;
+          m.textContent = `${payload.provider}/${payload.model} · ${payload.retrieval || 'auto'}`
+            + ` · ${u.input || 0} in / ${u.output || 0} out${cacheTok}${cost}${hit}`
+            + (speed ? ` · ${speed}` : '');
           bot.appendChild(m);
         } else if (kind === 'error') {
           bodyEl.classList.remove('meta');
           bodyEl.innerHTML = `<span class="err">${esc(payload)}</span>`;
         }
-      }
-    }
+      });
   } catch (err) {
     bodyEl.classList.remove('meta');
     bodyEl.innerHTML = `<span class="err">${esc(err.message || err)}</span>`;
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// -------------------------------------------------------------- comparison
+async function runCompare(question){
+  const bot = addMsg('bot',
+    `<div class="cmp"></div><div class="body meta"><span class="spin"></span> porównuję tryby…</div>`);
+  const wrap = bot.querySelector('.cmp');
+  const foot = bot.querySelector('.body');
+  const rows = [];
+  try {
+    await sse('/api/compare', { question }, ({ kind, payload }) => {
+      if (kind === 'row') { rows.push(payload); drawCompare(wrap, rows, null, question); }
+      else if (kind === 'done') {
+        drawCompare(wrap, rows, payload.agreement, question);
+        const ok = rows.filter(r => r.ok);
+        const ms = ok.reduce((n, r) => n + (r.stats.ms || 0), 0);
+        const tok = ok.reduce((n, r) => n + (r.stats.jev
+          ? r.stats.jev.input_tokens + r.stats.jev.output_tokens : 0), 0);
+        const usd = ok.reduce((n, r) => n + ((r.stats.jev && r.stats.jev.cost_usd) || 0), 0);
+        foot.textContent = `${ok.length}/${rows.length} trybów · ${fmtMs(ms)} łącznie · `
+          + (tok ? `${fmtTok(tok)} tokenów Jev` : 'bez płatnych wywołań')
+          + (usd ? ` · ~$${usd.toFixed(4)}` : '')
+          + ' · bez czytnika (0 tokenów obrazu)';
+      } else if (kind === 'error') {
+        foot.innerHTML = `<span class="err">${esc(payload)}</span>`;
+      }
+    });
+  } catch (err) {
+    foot.innerHTML = `<span class="err">${esc(err.message || err)}</span>`;
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function drawCompare(wrap, rows, agree, question){
+  // How many modes returned each page. Redrawing every card as each row lands
+  // is four innerHTMLs, and it keeps that count honest while they arrive.
+  const seen = {};
+  rows.forEach(r => r.pages.forEach(p => {
+    const k = p.article_id + ':' + p.page;
+    seen[k] = (seen[k] || 0) + 1;
+  }));
+  wrap.innerHTML = '';
+  rows.forEach(r => wrap.appendChild(modeCard(r, seen, rows.length, question)));
+  if (agree && agree.length) wrap.appendChild(agreeCard(agree, rows));
+}
+
+function modeCard(r, seen, total, question){
+  const el = document.createElement('div');
+  el.className = 'mode' + (r.ok ? '' : ' bad');
+  if (!r.ok){
+    el.innerHTML = `<div class="hd"><span class="nm">${esc(r.mode)}</span>
+      <span class="tag">nie uruchomiono</span></div>
+      <div class="note">${esc(r.error)}</div>`;
+    return el;
+  }
+  const s = r.stats;
+  const fact = (v, label) => `<div class="fact"><b>${esc(String(v))}</b><span>${label}</span></div>`;
+  el.innerHTML = `<div class="hd">
+      <span class="nm">${esc(r.mode)}</span>
+      <span class="tag${s.reranker !== 'none' ? ' on' : ''}">rerank: ${esc(s.reranker)}</span>
+      ${answerBadge(s)}
+      <span class="ms">${fmtMs(s.ms)}</span>
+    </div>
+    <div class="facts">
+      ${fact(s.pages, 'stron')}
+      ${fact(s.unique_chunks, 'chunków')}
+      ${fact(s.candidate_pages, 'kandydatów')}
+      ${fact(s.searches + (s.lexical_calls ? '+' + s.lexical_calls : ''), 'zapytań')}
+      ${fact(fmtCost(s), 'koszt')}
+    </div>`;
+
+  const chips = document.createElement('div');
+  chips.className = 'pgs';
+  r.pages.forEach(p => {
+    const solo = total > 1 && seen[p.article_id + ':' + p.page] === 1;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pg-chip' + (solo ? ' solo' : '');
+    b.textContent = 's.' + p.page;
+    b.title = `${p.document} — ${p.found_by}, ranking ${p.score}, `
+            + `${p.n_chunks} chunków${solo ? ' · tylko ten tryb' : ''}`;
+    b.addEventListener('click', () => show(p.article_id, p.page, -1));
+    chips.appendChild(b);
+  });
+  el.appendChild(chips);
+
+  (s.notes || []).forEach(n => {
+    const d = document.createElement('div');
+    d.className = 'note'; d.textContent = '! ' + n;
+    el.appendChild(d);
+  });
+
+  const det = document.createElement('details');
+  det.className = 'det';
+  det.innerHTML = '<summary>szczegóły</summary>' + statsDetails(s, r.variants);
+  el.appendChild(det);
+
+  const go = document.createElement('button');
+  go.type = 'button'; go.className = 'mini';
+  go.textContent = 'odpowiedz tym trybem';
+  go.addEventListener('click', async () => {
+    go.disabled = true; sendEl.disabled = true;
+    try { await ask(question, r.mode); }
+    finally { sendEl.disabled = false; go.disabled = false; qEl.focus(); }
+  });
+  el.appendChild(go);
+  return el;
+}
+
+// Where the modes agreed and where exactly one went its own way. That is the
+// reason to run a comparison at all, and it is the thing four lists of page
+// numbers side by side make you work out by eye.
+function agreeCard(agree, rows){
+  const total = rows.filter(r => r.ok).length;
+  const el = document.createElement('div');
+  el.className = 'mode';
+  const body = agree.map(a =>
+    `<tr><td>${a.modes.length === total
+        ? '<span class="tag on">wszystkie</span>'
+        : `<span class="tag">${a.modes.length}/${total}</span>`}</td>`
+    + `<td><b>s.${a.page}</b> <span class="dim">${esc(V.titles.get(a.article_id) || '')}</span>`
+    + `<br><span class="dim">${esc(a.modes.join(', '))}</span></td></tr>`).join('');
+  el.innerHTML = `<div class="hd"><span class="nm">zgodność</span>
+      <span class="ms">${agree.length} stron łącznie</span></div>
+    <div class="det"><table>${body}</table></div>`;
+  return el;
+}
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const question = qEl.value.trim(); if (!question) return;
+  qEl.value = ''; sendEl.disabled = true;
+  addMsg('user', esc(question));
+  try {
+    if (cmpEl.checked) await runCompare(question);
+    else await ask(question, modeEl.value);
   } finally {
     sendEl.disabled = false; qEl.focus();
-    logEl.scrollTop = logEl.scrollHeight;
   }
 });
+
+// The button says what pressing it will do: a comparison does not answer.
+cmpEl.addEventListener('change', () => {
+  sendEl.textContent = cmpEl.checked ? 'Porównaj' : 'Zapytaj';
+  modeEl.disabled = cmpEl.checked;
+});
+
 qEl.focus();
 </script>
 </body>

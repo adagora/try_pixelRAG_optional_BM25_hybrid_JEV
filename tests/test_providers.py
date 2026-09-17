@@ -36,7 +36,10 @@ def wired(monkeypatch, index, fake_reader, tmp_path):
     for tile in (0, 1):
         p = index.page_image(0, tile)
         Image.new("RGB", (200, 280), (240, 240, 240)).save(p)
-    monkeypatch.setattr(rag, "search", lambda q, n, timeout=120: [
+    # The faiss HTTP call is the seam, not rag.search: `search` is now one of
+    # four mode-bound searchers, and patching it over would leave the mode
+    # machinery every answer goes through unexercised.
+    monkeypatch.setattr(rag, "_raw_search", lambda q, n, timeout=120: [
         {"article_id": 0, "tile_index": 0, "chunk_index": 1, "score": 0.62},
         {"article_id": 0, "tile_index": 0, "chunk_index": 2, "score": 0.55},
         {"article_id": 0, "tile_index": 1, "chunk_index": 1, "score": 0.48},
@@ -148,10 +151,75 @@ def test_an_unpriced_reader_reports_no_cost(wired):
 def test_no_pages_gives_the_documented_non_answer(wired, monkeypatch):
     """Never invent an answer when retrieval found nothing."""
     reader = wired()
-    monkeypatch.setattr(rag, "search", lambda q, n, timeout=120: [])
+    monkeypatch.setattr(rag, "_raw_search", lambda q, n, timeout=120: [])
     result = rag.run_agent("q")
     assert result["answer"] == rag.NO_PAGES_PL
     assert reader.calls == 0                     # and never pay for the read
+
+
+def test_the_answer_says_which_mode_retrieved_it_and_where_the_time_went(wired):
+    """Retrieval is the part a mode changes and the reader is the part that
+    bills; an answer that reported one number for both could not show either."""
+    wired()
+    result = rag.run_agent("q", retrieval="visual")
+    assert result["retrieval"] == "visual"
+    t = result["timings"]
+    assert t["retrieval_ms"] >= 0
+    assert t["ttft_ms"] is not None                # this reader streams
+    assert t["total_ms"] >= t["retrieval_ms"]
+    assert t["reader_ms"] is not None
+
+
+def test_the_gate_judges_the_attached_pages_and_can_refuse(wired, monkeypatch):
+    """The reader is the expensive call; this is what stands in front of it."""
+    import jev
+
+    reader = wired()
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
+    seen = {}
+    monkeypatch.setattr(jev, "answerable",
+                        lambda q, texts, report=None: seen.setdefault("n", len(texts)) and 0.02)
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
+
+    result = rag.run_agent("Ile kosztuje samochód?")
+    assert result["answer"] == rag.NO_PAGES_PL
+    assert result["answerable"] == 0.02 and result["refused"]
+    assert reader.calls == 0                 # never paid for the read
+    assert seen["n"] == 2                    # judged the pages, not the pool
+
+
+def test_a_refusal_is_never_cached(wired, monkeypatch):
+    """A gated refusal has tile events and a non-empty answer, so the old
+    `worth caching` test would have pinned it for every rephrasing."""
+    import jev
+
+    wired()
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
+    monkeypatch.setattr(jev, "answerable", lambda q, texts, report=None: 0.01)
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
+    rag.run_agent("q")
+
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.0)
+    reader = wired(answer="Teraz działa")
+    assert rag.run_agent("q")["answer"] == "Teraz działa"
+    assert reader.calls == 1
+
+
+def test_a_failing_gate_never_costs_an_answer(wired, monkeypatch):
+    import jev
+
+    def boom(*a, **k):
+        raise RuntimeError("typesafe down")
+
+    reader = wired(answer="Odpowiedź.")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(jev, "answerable", boom)
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.9)
+    result = rag.run_agent("q")
+    assert result["answer"] == "Odpowiedź." and result["answerable"] is None
+    assert reader.calls == 1
 
 
 # -- the answer cache, end to end -------------------------------------------
@@ -176,6 +244,16 @@ def test_a_cache_hit_still_draws_the_pages(wired):
     assert [e["type"] for e in seen].count("tile") == 2
 
 
+def test_a_cache_hit_does_not_report_the_time_the_original_answer_took(wired):
+    """Keeping the stored timings would make the cache look exactly as slow as
+    the work it exists to skip."""
+    wired()
+    rag.run_agent("q")
+    result = rag.run_agent("q")
+    assert result["cached"] and result["timings"]["retrieval_ms"] == 0.0
+    assert result["timings"]["total_ms"] < 1000
+
+
 def test_a_different_model_misses_the_cache(wired):
     """Model is part of the exact-match namespace: a stale hit from another
     model is a wrong answer, not a saving."""
@@ -189,11 +267,11 @@ def test_a_different_model_misses_the_cache(wired):
 def test_a_non_answer_is_never_cached(wired, monkeypatch):
     """'no pages matched' is usually a transient search-service problem, and
     pinning it would keep answering that way."""
-    monkeypatch.setattr(rag, "search", lambda q, n, timeout=120: [])
+    monkeypatch.setattr(rag, "_raw_search", lambda q, n, timeout=120: [])
     wired()
     rag.run_agent("q")
     reader = wired(answer="Teraz działa")
-    monkeypatch.setattr(rag, "search", lambda q, n, timeout=120: [
+    monkeypatch.setattr(rag, "_raw_search", lambda q, n, timeout=120: [
         {"article_id": 0, "tile_index": 0, "chunk_index": 1, "score": 0.6}])
     assert rag.run_agent("q")["answer"] == "Teraz działa"
     assert reader.calls == 1

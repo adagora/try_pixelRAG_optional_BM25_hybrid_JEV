@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import compare as compare_modes
 import rag
 import snip
 
@@ -43,6 +44,17 @@ app.mount("/vendor", StaticFiles(directory=HERE / "static" / "vendor"), name="ve
 class Ask(BaseModel):
     question: str
     api_key: str | None = None  # optional paste from the UI; overrides env for this ask
+    # Which retrieval mode answers. None/"auto" is the environment's default,
+    # which is what every client that predates the picker sends.
+    retrieval: str | None = None
+
+
+class Compare(BaseModel):
+    """Retrieval only, several modes, one question. No reader, no image tokens."""
+
+    question: str
+    modes: list[str] | None = None
+    pages: int | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -52,6 +64,47 @@ def index():
         (HERE / "static" / "index.html").read_text(encoding="utf-8"),
         media_type="text/html; charset=utf-8",
     )
+
+
+@app.get("/api/modes")
+def retrieval_modes():
+    """The retrieval modes this box can actually run, and why not where it can't.
+
+    The UI greys out a blocked mode and shows the reason rather than hiding it:
+    "jev — TYPESAFE_API_KEY is not set" is a setup instruction, and a mode that
+    silently vanished is a bug report.
+    """
+    return {"modes": compare_modes.modes(), "default": rag.default_retrieval(),
+            "pages": rag.ONESHOT_PAGES}
+
+
+@app.post("/api/compare")
+def compare_retrieval(req: Compare):
+    """Stream one row per retrieval mode: what it found and what it cost.
+
+    Server-sent events for the same reason /api/ask uses them — each mode is a
+    second or more of real retrieval and they run sequentially by design (see
+    compare.py), so the table fills in as the modes finish instead of arriving
+    all at once after the slowest one.
+    """
+    def stream():
+        try:
+            rows = []
+            for row in compare_modes.compare(req.question, req.modes, req.pages):
+                rows.append(row)
+                yield _sse({"kind": "row", "payload": row})
+            yield _sse({"kind": "done",
+                        "payload": {"agreement": compare_modes.agreement(rows)}})
+        except Exception as e:
+            yield _sse({"kind": "error", "payload": f"{type(e).__name__}: {e}"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @app.get("/api/docs")
@@ -172,6 +225,7 @@ def ask(req: Ask):
                 req.question,
                 on_event=lambda ev: q.put(("event", ev)),
                 api_key=key,
+                retrieval=req.retrieval,
             )
             q.put(("done", result))
         except Exception as e:
@@ -186,7 +240,7 @@ def ask(req: Ask):
             kind, payload = q.get()
             if kind is None:
                 break
-            yield f"data: {json.dumps({'kind': kind, 'payload': payload}, ensure_ascii=False)}\n\n"
+            yield _sse({"kind": kind, "payload": payload})
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

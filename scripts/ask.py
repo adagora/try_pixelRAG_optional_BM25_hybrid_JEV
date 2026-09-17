@@ -32,6 +32,11 @@ def main():
     ap.add_argument("--max-steps", type=int, default=rag.MAX_STEPS)
     ap.add_argument("--mode", choices=["oneshot", "agent"],
                     help="default: PIXELRAG_ASK or oneshot")
+    ap.add_argument("--retrieval", choices=["auto", *rag.RETRIEVAL_MODES],
+                    default="auto",
+                    help="which retriever answers; default: auto "
+                         "(PIXELRAG_JEV / PIXELRAG_HYBRID). "
+                         "scripts/compare.py runs them against each other")
     ap.add_argument("--provider", choices=["gemini", "anthropic"],
                     help="default: whichever API key is set")
     ap.add_argument("--list-models", action="store_true",
@@ -54,7 +59,7 @@ def main():
 
     if args.retrieve_only:
         try:
-            hits = rag.search(args.question, n_results=args.k)
+            hits = rag.searcher(args.retrieval)(args.question, args.k)
         except requests.RequestException as e:
             sys.exit(f"Search API unreachable on {rag.SEARCH_API}: {e}")
         for h in hits:
@@ -72,7 +77,13 @@ def main():
     def show(ev):
         nonlocal streamed
         if ev["type"] == "search":
-            print(f"  ⌕ searched {ev['query']!r} — {len(ev['hits'])} hits", file=sys.stderr)
+            s = ev.get("stats") or {}
+            detail = (f"{s['unique_chunks']} chunks → {s['pages']} pages · "
+                      f"{s['reranker']} · {s['ms']:.0f}ms" if s
+                      else f"{len(ev['hits'])} hits")
+            print(f"  ⌕ searched {ev['query']!r} — {detail}", file=sys.stderr)
+            for note in s.get("notes", []):
+                print(f"  ! {note}", file=sys.stderr)
         elif ev["type"] == "tile":
             print(f"  ▣ read {ev['document']} p{ev['page']} region {ev['chunk_index']}",
                   file=sys.stderr)
@@ -106,7 +117,7 @@ def main():
     try:
         result = rag.run_agent(args.question, on_event=show,
                                max_steps=args.max_steps, provider=args.provider,
-                               mode=args.mode)
+                               mode=args.mode, retrieval=args.retrieval)
     except requests.RequestException as e:
         sys.exit(f"Search API unreachable on {rag.SEARCH_API}: {e}")
 
@@ -126,8 +137,17 @@ def main():
     cache_tok = ""
     if u.get("cache_read"):
         cache_tok = f" · {u['cache_read']} cache-read"
-    print(f"\n[{result['provider']}/{result['model']} · {result['steps']} round trips · "
-          f"{u['input']} in / {u['output']} out{think}{cache_tok}{cost}{cached}]",
+    t = result.get("timings") or {}
+    speed = ""
+    if t.get("total_ms") is not None:
+        parts = [f"retrieval {t['retrieval_ms']:.0f}ms"] if t.get("retrieval_ms") is not None else []
+        if t.get("ttft_ms") is not None:
+            parts.append(f"first token {t['ttft_ms']:.0f}ms")
+        parts.append(f"total {t['total_ms']:.0f}ms")
+        speed = " · " + " / ".join(parts)
+    print(f"\n[{result['provider']}/{result['model']} · {result.get('retrieval', 'auto')} · "
+          f"{result['steps']} round trips · "
+          f"{u['input']} in / {u['output']} out{think}{cache_tok}{cost}{cached}{speed}]",
           file=sys.stderr)
 
 

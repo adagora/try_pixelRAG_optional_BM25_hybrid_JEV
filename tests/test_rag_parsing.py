@@ -114,15 +114,19 @@ def test_detect_provider_falls_back_to_gemini(monkeypatch):
 def test_cache_namespace_separates_everything_that_moves_the_answer():
     """Only the question is fuzzy-matched; these are exact-match, because a
     stale hit quotes last week's price list."""
-    base = rag._cache_namespace("gemini", "m", "oneshot")
-    assert base != rag._cache_namespace("anthropic", "m", "oneshot")
-    assert base != rag._cache_namespace("gemini", "other", "oneshot")
-    assert base != rag._cache_namespace("gemini", "m", "agent")
+    base = rag._cache_namespace("gemini", "m", "oneshot", "visual")
+    assert base != rag._cache_namespace("anthropic", "m", "oneshot", "visual")
+    assert base != rag._cache_namespace("gemini", "other", "oneshot", "visual")
+    assert base != rag._cache_namespace("gemini", "m", "agent", "visual")
+    # Retrieval mode decides which pages the reader was shown, so it moves the
+    # answer as surely as the model does.
+    assert base != rag._cache_namespace("gemini", "m", "oneshot", "hybrid")
+    assert base != rag._cache_namespace("gemini", "m", "oneshot", "jev")
 
 
 def test_cache_namespace_includes_the_index_identity():
     assert rag.answer_cache.index_fingerprint(rag.INDEX_DIR) in \
-        rag._cache_namespace("gemini", "m", "oneshot")
+        rag._cache_namespace("gemini", "m", "oneshot", "visual")
 
 
 # -- cost -------------------------------------------------------------------
@@ -133,7 +137,7 @@ def test_anthropic_cost_bills_cached_tokens_at_their_own_rate():
     r = rag._done("a", [], providers.Usage(input=1_000_000, output=0,
                                            cache_read=1_000_000,
                                            cache_write=1_000_000),
-                  1, providers.AnthropicReader())
+                  1, providers.AnthropicReader(), "visual", {})
     rin, _ = providers.ANTHROPIC_RATES
     assert r["usage"]["cost_usd"] == pytest.approx(rin + rin * 0.1 + rin * 1.25)
 
@@ -141,14 +145,14 @@ def test_anthropic_cost_bills_cached_tokens_at_their_own_rate():
 def test_gemini_reports_tokens_but_not_a_rate():
     """Pricing varies by model and tier, so that path does not guess."""
     r = rag._done("a", [], providers.Usage(input=100, output=50, thoughts=10),
-                  1, providers.GeminiReader())
+                  1, providers.GeminiReader(), "visual", {})
     assert r["usage"]["cost_usd"] is None
     assert r["usage"]["thoughts"] == 10
 
 
 def test_done_splits_the_citation_block_out_of_the_answer(fake_reader):
     r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}', [],
-                  providers.Usage(), 1, fake_reader())
+                  providers.Usage(), 1, fake_reader(), "visual", {})
     assert r["answer"] == "Odp."
 
 
@@ -160,7 +164,7 @@ def test_done_never_fails_the_answer_over_highlighting(monkeypatch, fake_reader)
     monkeypatch.setattr(rag, "resolve_citations", boom)
     r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}',
                   [{"type": "tile", "article_id": 0, "page": 1, "document": "d"}],
-                  providers.Usage(), 1, fake_reader())
+                  providers.Usage(), 1, fake_reader(), "visual", {})
     assert r["answer"] == "Odp." and r["citations"] == []
 
 
