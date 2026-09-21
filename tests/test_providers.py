@@ -25,6 +25,13 @@ def wired(monkeypatch, index, fake_reader, tmp_path):
     import chunkmeta
 
     monkeypatch.setattr(rag, "LAYOUT", index)
+    # The project's own .env sets PIXELRAG_HYBRID=1, which rag.py reads at
+    # import — so without this a gate test that also sets TYPESAFE_API_KEY
+    # resolves to `jev+hybrid` and BM25 answers from the REAL text sidecar,
+    # nominating an article_id the one-article fixture does not have. It
+    # depended on whether the question's words happened to be in the corpus.
+    # test_modes.py's fixture has always pinned this; this one had not.
+    monkeypatch.setattr(rag, "HYBRID", False)
     monkeypatch.setattr(rag, "_scale_of",
                         lambda a, t, c: chunkmeta.scale_of(a, t, c, index))
     monkeypatch.setattr(rag, "doc_title", lambda aid: f"doc{aid}")
@@ -140,7 +147,7 @@ def test_the_citation_block_is_stripped_from_the_answer(wired):
 def test_cost_comes_from_the_reader(wired):
     wired(usage=providers.Usage(input=1000, output=200), cost=0.0125)
     u = rag.run_agent("q")["usage"]
-    assert u["input"] == 1000 and u["output"] == 200 and u["cost_usd"] == 0.0125
+    assert u["input"] == 1000 and u["output"] == 200 and u["cost_usd"] == 0.0125  # ubs:ignore — fixture literal, passed through unchanged
 
 
 def test_an_unpriced_reader_reports_no_cost(wired):
@@ -178,15 +185,84 @@ def test_the_gate_judges_the_attached_pages_and_can_refuse(wired, monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "k")
     monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
     seen = {}
-    monkeypatch.setattr(jev, "answerable",
-                        lambda q, texts, report=None: seen.setdefault("n", len(texts)) and 0.02)
+
+    def judged(q, texts, report=None):
+        seen["n"] = len(texts)
+        return jev.Gate(answerable=0.02, scope=0.91)
+
+    monkeypatch.setattr(jev, "gate", judged)
     monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
 
     result = rag.run_agent("Ile kosztuje samochód?")
-    assert result["answer"] == rag.NO_PAGES_PL
-    assert result["answerable"] == 0.02 and result["refused"]
+    # In scope (0.91) but not in these pages (0.02): the corpus is the right
+    # one and the answer is not in it, which is its own sentence.
+    assert result["answer"] == rag.REFUSAL_PL["not-in-corpus"]
+    assert result["answerable"] == 0.02 and result["scope"] == 0.91  # ubs:ignore — stub literals, nothing computes on them
+    assert result["refused"] == "not-in-corpus"
     assert reader.calls == 0                 # never paid for the read
     assert seen["n"] == 2                    # judged the pages, not the pool
+
+
+def test_out_of_scope_refuses_on_scope_alone_and_says_something_else(wired, monkeypatch):
+    """Answerability cannot tell "we don't stock that" from "wrong shop".
+
+    Measured over this index, a question the corpus is about but does not
+    answer scores 0.04 answerable / 0.64 scope; a question from another domain
+    scores 0.01 / 0.05. Routing on answerability alone collapses those into one
+    event and shows the user advice meant for the other one.
+    """
+    import jev
+
+    reader = wired()
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
+    monkeypatch.setattr(jev, "gate",
+                        lambda q, t, report=None: jev.Gate(answerable=0.01, scope=0.05))
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
+
+    result = rag.run_agent("Jak wymienić olej w silniku?")
+    assert result["refused"] == "out-of-scope"
+    assert result["answer"] == rag.REFUSAL_PL["out-of-scope"]
+    assert result["answer"] != rag.REFUSAL_PL["not-in-corpus"]
+    assert reader.calls == 0
+
+
+def test_the_gate_events_carry_what_the_ui_draws(wired, monkeypatch):
+    """`scope` and `verdict` are read by scripts/static/index.html to decide
+    which refusal sentence to show. They are a wire contract, not a detail:
+    drop either and the browser silently falls back to the old message, which
+    is the wrong one for exactly the case scope was added to catch."""
+    import jev
+
+    wired()
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
+    monkeypatch.setattr(jev, "gate",
+                        lambda q, t, report=None: jev.Gate(answerable=0.02, scope=0.05))
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
+
+    seen = []
+    rag.run_agent("q", on_event=seen.append)
+    gate = next(e for e in seen if e["type"] == "answerable")
+    assert gate["value"] == 0.02 and gate["scope"] == 0.05  # ubs:ignore — stub literals, nothing computes on them
+    refused = next(e for e in seen if e["type"] == "refused")
+    assert refused["verdict"] == "out-of-scope"
+    assert refused["scope"] == 0.05 and refused["answerable"] == 0.02  # ubs:ignore — stub literals, nothing computes on them
+
+
+def test_a_missing_scope_judgment_still_gates_on_answerability(wired, monkeypatch):
+    """Scope was added after the gate shipped; losing it must not open the gate."""
+    import jev
+
+    reader = wired()
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
+    monkeypatch.setattr(jev, "gate",
+                        lambda q, t, report=None: jev.Gate(answerable=0.02, scope=None))
+    monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
+
+    assert rag.run_agent("q")["refused"] == "not-in-corpus"
+    assert reader.calls == 0
 
 
 def test_a_refusal_is_never_cached(wired, monkeypatch):
@@ -197,7 +273,8 @@ def test_a_refusal_is_never_cached(wired, monkeypatch):
     wired()
     monkeypatch.setenv("TYPESAFE_API_KEY", "k")
     monkeypatch.setattr(rag, "_page_texts", lambda pages: ["tekst"] * len(pages))
-    monkeypatch.setattr(jev, "answerable", lambda q, texts, report=None: 0.01)
+    monkeypatch.setattr(jev, "gate",
+                        lambda q, t, report=None: jev.Gate(answerable=0.01, scope=0.9))
     monkeypatch.setattr(rag, "JEV_REFUSE", 0.3)
     rag.run_agent("q")
 
@@ -231,7 +308,7 @@ def test_a_repeated_question_skips_the_reader(wired):
     assert reader.calls == 1                     # the second never reached it
     assert second["answer"] == first["answer"]
     assert second["cached"] is True
-    assert second["usage"]["input"] == 0 and second["usage"]["cost_usd"] == 0.0
+    assert second["usage"]["input"] == 0 and second["usage"]["cost_usd"] == 0.0  # ubs:ignore — cache hit assigns literal 0.0
 
 
 def test_a_cache_hit_still_draws_the_pages(wired):

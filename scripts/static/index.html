@@ -793,6 +793,18 @@ function answerBadge(s){
        + `${label} ${pct(v)}</span>`;
 }
 
+// Scope sits next to answerability and never replaces it. A question the corpus
+// cannot answer scores low on both when it belongs to another domain, and low
+// on one only when the corpus is right but does not carry the fact — two
+// different things to tell a user, and one number cannot say which.
+function scopeBadge(s){
+  const v = s && s.xray && s.xray.facets ? s.xray.facets.scope : null;
+  if (v == null) return '';
+  return `<span class="tag${v >= 0.5 ? ' on' : ''}"`
+       + ` title="Jev: czy pytanie dotyczy dziedziny tych dokumentów">`
+       + `zakres ${pct(v)}</span>`;
+}
+
 const trow = (label, value) => `<tr><td>${esc(label)}</td><td>${value}</td></tr>`;
 
 // The numbers behind the summary. One function for the answer trace and for a
@@ -831,6 +843,33 @@ function statsDetails(s, variants){
       + trow('razem', `${j.input_tokens} in / ${j.output_tokens} out · ${fmtCost(s)}`)
       + trow('etapy', Object.entries(j.stages)
           .map(([k, v]) => `${esc(k)} ${fmtMs(v)}`).join(' · ') || '—')
+      + '</table>';
+  }
+  // The X-ray block. It reports the sweep's coverage FIRST, because every
+  // other number it produces is worth less if the sweep was not exhaustive,
+  // and a sweep that lost a shard looks exactly like one that did not.
+  const x = s.xray;
+  if (x){
+    const facets = x.facets || {};
+    const noul = (label, v, hint) => v == null ? ''
+      : trow(label, `${pct(v)} <span class="dim">${esc(hint)}</span>`);
+    html += '<h5>x-ray — cały korpus, jedno wywołanie</h5><table>'
+      + trow('pokrycie', `${x.judged}/${x.pages} stron ocenionych`
+          + (x.blind ? ` · ${x.blind} bez warstwy tekstowej` : '')
+          + ` · ${x.shards} zapytanie/a`
+          + (x.exhaustive
+              ? ' <span class="tag on">wyczerpujące</span>'
+              : ` <span class="err">NIEPEŁNE — ${x.unjudged} stron bez oceny</span>`))
+      + noul('odpowiedź w korpusie', facets.answerable, 'czy gdziekolwiek jest odpowiedź')
+      + noul('zakres', facets.scope, 'czy pytanie dotyczy tej dziedziny')
+      + noul('sprzeczność', facets.premise, 'czy korpus przeczy założeniu pytania')
+      + noul('próba sterowania', facets.injection, 'czy pytanie atakuje instrukcje')
+      + (facets.kind == null ? '' : trow('rodzaj pytania',
+          `<code>${esc(facets.kind)}</code> <span class="dim">`
+          + `pewność ${pct(facets.kind_confidence)}</span>`))
+      + (facets.granularity == null ? '' : trow('zakres odpowiedzi',
+          `<code>${esc(facets.granularity)}</code> <span class="dim">`
+          + `pewność ${pct(facets.granularity_confidence)}</span>`))
       + '</table>';
   }
   if (variants && variants.length){
@@ -915,12 +954,21 @@ async function ask(question, retrieval){
           } else if (payload.type === 'answerable') {
             const v = payload.value;
             const word = v >= 0.7 ? 'jest' : v >= 0.3 ? 'niepewne' : 'BRAK';
+            // Scope is reported next to answerability rather than folded into
+            // it: low/low and low/HIGH are different failures and the pair is
+            // the diagnosis. See jev.Gate.
+            const sc = payload.scope == null ? ''
+              : ` · zakres korpusu <b>${pct(payload.scope)}</b>`;
             step(v >= 0.3 ? '?' : '!',
-                 `odpowiedź w tych stronach: <b>${word} ${pct(v)}</b> `
+                 `odpowiedź w tych stronach: <b>${word} ${pct(v)}</b>${sc} `
                  + `<span class="dim">· ${payload.pages} stron · ${fmtMs(payload.ms)}</span>`);
           } else if (payload.type === 'refused') {
-            step('!', `<span class="note">Jev: odpowiedzi nie ma w pobranych `
-                 + `stronach (${pct(payload.answerable)}) — pominięto czytnik</span>`);
+            const why = payload.verdict === 'out-of-scope'
+              ? `pytanie dotyczy innej dziedziny niż korpus `
+                + `(zakres ${pct(payload.scope)})`
+              : `odpowiedzi nie ma w pobranych stronach `
+                + `(${pct(payload.answerable)})`;
+            step('!', `<span class="note">Jev: ${why} — pominięto czytnik</span>`);
           } else if (payload.type === 'tile_error') {
             step('!', `<span class="err">brak regionu ${payload.tile_index}:${payload.chunk_index}</span>`);
           } else if (payload.type === 'answer_delta') {
@@ -1034,10 +1082,12 @@ function modeCard(r, seen, total, question){
       <span class="nm">${esc(r.mode)}</span>
       <span class="tag${s.reranker !== 'none' ? ' on' : ''}">rerank: ${esc(s.reranker)}</span>
       ${answerBadge(s)}
+      ${scopeBadge(s)}
       <span class="ms">${fmtMs(s.ms)}</span>
     </div>
     <div class="facts">
-      ${fact(s.pages, 'stron')}
+      ${fact(s.xray ? `${s.xray.judged}/${s.xray.pages}` : s.pages,
+             s.xray ? 'ocenionych stron' : 'stron')}
       ${fact(s.unique_chunks, 'chunków')}
       ${fact(s.candidate_pages, 'kandydatów')}
       ${fact(s.searches + (s.lexical_calls ? '+' + s.lexical_calls : ''), 'zapytań')}

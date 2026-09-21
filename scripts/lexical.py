@@ -198,7 +198,14 @@ def _loaded() -> tuple[list[dict], BM25]:
     if not TEXT_SIDECAR.exists():
         raise FileNotFoundError(
             f"{TEXT_SIDECAR} missing — run scripts/build_text_index.py")
-    pages = json.loads(TEXT_SIDECAR.read_text(encoding="utf-8"))["pages"]
+    # A half-written sidecar reads as "hybrid is broken" rather than "hybrid is
+    # not built", and the two have different fixes, so say which one this is.
+    try:
+        pages = json.loads(TEXT_SIDECAR.read_text(encoding="utf-8"))["pages"]
+    except (json.JSONDecodeError, KeyError) as e:
+        raise ValueError(
+            f"{TEXT_SIDECAR} is unreadable ({e!r}) — the sidecar is incomplete; "
+            f"rebuild it with scripts/build_text_index.py") from e
     return pages, BM25([tokenise(p["text"]) for p in pages])
 
 

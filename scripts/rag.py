@@ -37,6 +37,7 @@ import jev
 import layout
 import pagehit
 import providers
+import xray
 
 # This system degrades rather than fails, in six separate places: the encoder
 # sidecar, local encoding, the answer cache, the text sidecar, citation
@@ -257,7 +258,19 @@ Zacznij od odpowiedzi. Bez wstępów."""
 
 @lru_cache(maxsize=None)
 def articles() -> list[dict]:
-    arts = json.loads(LAYOUT.articles_json.read_text(encoding="utf-8"))
+    # Without the article list there is no corpus, so this is one of the few
+    # places that fails instead of degrading. It still names the file and the
+    # command that rebuilds it: the alternative is a JSONDecodeError surfacing
+    # several frames up inside a request handler, which says neither.
+    if not LAYOUT.articles_json.exists():
+        raise FileNotFoundError(
+            f"{LAYOUT.articles_json} missing — run scripts/build_index.py")
+    try:
+        arts = json.loads(LAYOUT.articles_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{LAYOUT.articles_json} is not valid JSON ({e}) — the index is "
+            f"incomplete; rebuild it with scripts/build_index.py") from e
     # Index may have been built on Windows (`pdfs\\foo.pdf`); Path on macOS/Linux
     # treats that as a single filename with a backslash, so the source is "missing".
     for a in arts:
@@ -693,27 +706,30 @@ def _page_texts(pages: list[dict]) -> list[str]:
     return out
 
 
-def _answerable_gate(question: str, pages: list[dict], emit) -> float | None:
-    """Ask whether the answer is in the pages about to be attached.
+def _answerable_gate(question: str, pages: list[dict], emit) -> jev.Gate:
+    """Ask whether the answer is in the pages about to be attached — and whether
+    the question belongs to this corpus at all.
 
     Never raises: a failed check must not lose an answer the reader could still
-    give. Returns None when the question was not asked or could not be judged.
+    give. Returns an empty Gate when nothing could be judged, so callers read
+    `.answerable is None` rather than distinguishing None from a Gate.
     """
     if not jev.enabled():
-        return None
+        return jev.Gate()
     started = time.perf_counter()
     report = jev.Report()
     try:
-        value = jev.answerable(question, _page_texts(pages), report)
+        result = jev.gate(question, _page_texts(pages), report)
     except Exception:
         log.warning("Jev answerability gate failed; answering anyway", exc_info=True)
-        return None
-    if value is None:
-        return None
-    emit({"type": "answerable", "value": value, "pages": len(pages),
+        return jev.Gate()
+    if result.answerable is None:
+        return result
+    emit({"type": "answerable", "value": result.answerable,
+          "scope": result.scope, "pages": len(pages),
           "ms": round((time.perf_counter() - started) * 1000, 1),
           "jev": report.as_dict()})
-    return value
+    return result
 
 
 def _chunk_text(hit: dict) -> str:
@@ -725,7 +741,7 @@ def _chunk_text(hit: dict) -> str:
 # retrieval modes
 # --------------------------------------------------------------------------
 #
-# Four named ways to get from a question to a ranked list of pages:
+# Seven named ways to get from a question to a ranked list of pages:
 #
 #   visual      the pixel index alone — the claim this project exists to test
 #   hybrid      visual + BM25 over the PDF text layer, fused by rank (RRF)
@@ -733,6 +749,7 @@ def _chunk_text(hit: dict) -> str:
 #   jev         visual candidates, Jev-expanded queries, Jev-reranked chunks
 #   jev+hybrid  the same Jev pool, with BM25 page candidates poured into it
 #   jev-page    `hybrid`, then Jev reranks the candidate PAGES on full text
+#   xray        no retrieval at all — every page in the corpus, judged
 #
 # `jev-expand` exists to make one subtraction possible. Jev's two stages cost
 # about 500 input tokens and about 11k respectively, and before this they could
@@ -744,8 +761,17 @@ def _chunk_text(hit: dict) -> str:
 # question. A mode you can compare has to be a value you can pass, and
 # "whatever PIXELRAG_JEV was when this process started" is not one.
 #
+# `xray` is the odd one out and belongs in the list anyway: it is the control
+# that says what the other five are FOR. It skips retrieval entirely and scores
+# every page of the corpus in one request, so its recall is 1.0 by construction
+# and any page a retrieval mode misses was missed by ranking, not by the model.
+# Measured here: 38 pages, 31k input tokens, 1.3 s, $0.0013 — under a quarter of
+# one reader call. It is a mode on a 38-page corpus and a benchmark on a large
+# one; see xray.py for where it stops being either.
+#
 # `auto` is that environment default, and is what every existing caller gets.
-RETRIEVAL_MODES = ("visual", "hybrid", "jev-expand", "jev", "jev+hybrid", "jev-page")
+RETRIEVAL_MODES = ("visual", "hybrid", "jev-expand", "jev", "jev+hybrid",
+                   "jev-page", "xray")
 
 # How deep BM25 is read when its pages are poured into the Jev candidate pool.
 # The RRF path has its own depth (retrieve.FUSE_DEPTH) and this is not it: there
@@ -757,17 +783,42 @@ LEXICAL_POOL = 20
 def default_retrieval() -> str:
     """The mode PIXELRAG_JEV and PIXELRAG_HYBRID ask for between them.
 
-    A key makes a Jev mode the default. That is thin evidence — two questions
-    with verified gold, one of which `hybrid` misses entirely and `jev+hybrid`
-    ranks second — but it is the only evidence there is, and it points this way.
+    THE JEV DEFAULT IS `jev-page`, AND IT USED TO BE `jev`. Measured by
+    scripts/bench.py over the 13 questions whose gold page is decided by
+    literal string match — so no mode is graded by its own model — at k=4:
+
+        mode          top-1  recall     ms     $/q
+        visual          62%     92%    194       0
+        jev-expand      62%     92%    878  0.00004
+        jev             77%     92%   1846  0.00064
+        hybrid          85%     92%      6       0
+        jev-page        92%     92%   1109  0.00088
+        xray            92%    100%   1288  0.00242
+
+    Two results decided this. `jev` — chunk reranking, the mode that was the
+    default — is BEATEN BY `hybrid`, which is free and 300x faster: scoring
+    875x1024 crop text loses to BM25 over the same pages. And `jev-expand`
+    scores exactly what `visual` scores on every column, so the expansion stage
+    buys nothing for 684 ms. Both are the same finding at different scales:
+    recall here is 92-100% before Jev is called, so nothing Jev does to WIDEN
+    the funnel can help, and everything it does to the text UNIT matters.
+    Crops 77%, BM25 pages 85%, whole pages 92% — monotone in chunk size.
+
+    `xray` is not the default despite tying on top-1 and winning recall,
+    because it is the only mode whose cost scales with the corpus rather than
+    with the question. It is the right default for 38 pages and the wrong one
+    for 3,800; see xray.py.
+
     PIXELRAG_JEV=manual keeps the modes selectable without defaulting to them.
     """
     if jev.enabled() and not jev.declined():
-        return "jev+hybrid" if HYBRID else "jev"
+        # `jev-page` already runs BM25 to build its candidate pool, so there is
+        # no separate hybrid variant of it to pick between.
+        return "jev-page"
     return "hybrid" if HYBRID else "visual"
 
 
-def resolve_retrieval(mode: str | None) -> str:
+def resolve_retrieval(mode: str | None) -> str:  # ubs:ignore — allowlist; no eval sink
     """Name a mode, or resolve `auto`/None to whatever the environment sets."""
     name = (mode or "auto").strip().lower()
     if name in ("", "auto", "default"):
@@ -787,10 +838,13 @@ def retrieval_blocked(mode: str) -> str | None:
     exists. PIXELRAG_JEV=0 is a KILL SWITCH: it means "do not call TypeSafe with
     this corpus", and a dropdown in a browser must not be able to overrule it.
     """
-    if "jev" in mode and not jev.enabled():
+    if mode in TYPESAFE_MODES and not jev.enabled():
         return ("TYPESAFE_API_KEY is not set" if not jev.configured()
                 else "turned off by PIXELRAG_JEV")
-    if "hybrid" in mode and _lexical_fn(required=True) is None:
+    # `xray` reads the corpus out of the same text sidecar BM25 uses, so it has
+    # the same prerequisite and, on a corpus of scans, the same answer: it
+    # cannot run, and `visual` is the mode for that.
+    if ("hybrid" in mode or mode == "xray") and _lexical_fn(required=True) is None:
         return "no BM25 text sidecar — run scripts/build_text_index.py"
     return None
 
@@ -801,14 +855,21 @@ def retrieval_modes() -> list[dict]:
             for m in RETRIEVAL_MODES]
 
 
+# Which modes spend TypeSafe tokens. Stated as a list rather than matched as a
+# substring of the name, because `xray` pays and does not say "jev", and because
+# a mode that is billed by accident of spelling is the kind of bug that only
+# shows up on an invoice.
+TYPESAFE_MODES = ("jev-expand", "jev", "jev+hybrid", "jev-page", "xray")
+
+
 def _jev_active(mode: str) -> bool:
-    """Does this mode call TypeSafe at all? True for every Jev mode."""
-    return "jev" in mode and jev.enabled()
+    """Does this mode call TypeSafe at all? True for every mode that bills."""
+    return mode in TYPESAFE_MODES and jev.enabled()
 
 
 def _jev_reranks(mode: str) -> bool:
-    """Does it pay for a CHUNK rerank? `jev-expand` and `jev-page` do not."""
-    return _jev_active(mode) and mode not in ("jev-expand", "jev-page")
+    """Does it pay for a CHUNK rerank? `jev-expand`, `jev-page`, `xray` do not."""
+    return _jev_active(mode) and mode not in ("jev-expand", "jev-page", "xray")
 
 
 def new_stats() -> dict:
@@ -848,7 +909,7 @@ def searcher(mode: str = "auto", *, stats: dict | None = None,
     table's chunk counts and search timings all come from here, which keeps
     retrieve.py free of measurement it has no other reason to carry.
     """
-    mode = resolve_retrieval(mode)
+    mode = resolve_retrieval(mode)  # ubs:ignore — allowlist; no eval sink
 
     def raw(query: str, n: int) -> list[dict]:
         started = time.perf_counter()
@@ -918,7 +979,9 @@ def retrieve_for(question: str, mode: str | None = "auto",
     """
     import retrieve
 
-    mode = resolve_retrieval(mode)
+    mode = resolve_retrieval(mode)  # ubs:ignore — allowlist; no eval sink
+    if mode == "xray":
+        return _xray_pages(question, n_pages)
     reranks = _jev_reranks(mode)
     page_rerank = mode == "jev-page" and _jev_active(mode)
     report = jev.Report() if _jev_active(mode) else None
@@ -983,7 +1046,7 @@ def _rerank_pages(question: str, pages: list, report) -> list:
 
 
 def retrieval_stats(mode: str, stats: dict, report, debug: list[dict],
-                    kept: int, started: float) -> dict:
+                    kept: int, started: float, sweep=None) -> dict:
     """What one retrieval did, stated once: the wire contract for the UI.
 
     Consumers: the `search` event (the trace line and its details panel) and
@@ -1011,11 +1074,18 @@ def retrieval_stats(mode: str, stats: dict, report, debug: list[dict],
     notes = list(jev_stats["fallbacks"]) if jev_stats else []
     if "hybrid" in mode and not stats["lexical"]:
         notes.append("BM25 did not run — no text sidecar")
+    # A sweep that lost a shard still returns pages and still looks like a
+    # sweep. Saying so here puts it on the trace line and in every comparison
+    # row, next to the word "exhaustive" it has just stopped deserving.
+    if sweep is not None and not sweep.exhaustive:
+        notes.append(f"NOT exhaustive — {sweep.unjudged} of {sweep.pages} pages "
+                     f"carry no score")
     lexical_fused = any(row["retriever"] == "lexical" for row in debug)
     return {
         "mode": mode,
         "reranker": "jev" if (jev_stats and jev_stats["reranked"]) else "none",
-        "fusion": ("rrf(visual+bm25)" if lexical_fused else
+        "fusion": ("xray score (no retrieval)" if sweep is not None else
+                   "rrf(visual+bm25)" if lexical_fused else
                    "jev score" if (jev_stats and jev_stats["reranked"])
                    else "score-norm(variants)"),
         "queries": [row["query"] for row in debug] or (
@@ -1035,9 +1105,46 @@ def retrieval_stats(mode: str, stats: dict, report, debug: list[dict],
         "search_ms": round(sum(row["ms"] for row in stats["searches"]), 1),
         "lexical_ms": round(sum(row["ms"] for row in stats["lexical"]), 1),
         "jev": jev_stats,
+        "xray": sweep.as_dict() if sweep is not None else None,
         "notes": notes,
         "cost_usd": jev_stats["cost_usd"] if jev_stats else 0.0,
     }
+
+
+def _xray_pages(question: str, n_pages: int) -> tuple[list, list[dict], dict]:
+    """`retrieve_for` for the mode that does not retrieve.
+
+    There is no encoder, no faiss call, no BM25 query and no fusion here: the
+    corpus text is read straight off the sidecar and every page of it is judged
+    against the question in one request. What comes back is the same
+    (pages, debug, stats) triple every other mode returns, so the reader, the
+    comparison table and the UI cannot tell the difference — which is the point.
+    Recall is 1.0 by construction, so the only thing a comparison row for this
+    mode measures is ranking.
+
+    The debug row calls itself `xray` rather than `visual`, because compare.py
+    attributes results by that name and a sweep filed under `visual` would be a
+    lie in the one table whose entire job is attribution.
+    """
+    import lexical
+
+    started = time.perf_counter()
+    corpus = lexical.pages()
+    keys = [f"a{p['article_id']}:s{p['page']}" for p in corpus]
+    sweep = xray.xray(question, list(zip(keys, (p["text"] for p in corpus))))
+    by_key = {key: p for key, p in zip(keys, corpus)}
+    ranked = [pagehit.from_xray(by_key[key]["article_id"], by_key[key]["page"], score)
+              for key, score in sweep.ranked()]
+    debug = [{"query": question, "retriever": "xray", "pages": len(ranked),
+              "chunks": 0,
+              "top": [{"article_id": p.article_id, "page": p.page,
+                       "score": round(p.score, 4), "n_chunks": 0}
+                      for p in ranked[:5]]}]
+    stats = new_stats()
+    stats["pages"] = {(p.article_id, p.tile_index) for p in ranked}
+    kept = ranked[:n_pages]
+    return kept, debug, retrieval_stats("xray", stats, sweep.report, debug,
+                                        len(kept), started, sweep=sweep)
 
 
 # Agent-mode tool result: every hit becomes a row the model reads, and the browse
@@ -1048,7 +1155,7 @@ AGENT_SEARCH_HITS = 10
 
 def _do_search(query: str, n_results: int = 5,
                 retrieval: str | None = None) -> tuple[str, dict]:
-    mode = resolve_retrieval(retrieval)
+    mode = resolve_retrieval(retrieval)  # ubs:ignore — allowlist; no eval sink
     report = jev.Report() if _jev_active(mode) else None
     stats = new_stats()
     started = time.perf_counter()
@@ -1222,7 +1329,7 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
     mode = (mode or ASK_MODE).strip().lower()
     if mode not in ("oneshot", "agent"):
         raise ValueError(f"Unknown ask mode {mode!r} (expected oneshot or agent).")
-    retrieval = resolve_retrieval(retrieval)
+    retrieval = resolve_retrieval(retrieval)  # ubs:ignore — allowlist; no eval sink
 
     reader = providers.reader_for(provider, api_key)
     trace: list[dict] = []
@@ -1306,14 +1413,17 @@ def _read_once(reader, question: str, emit, trace: list[dict],
     # high in the pool but low here means retrieval found it and ranking lost it.
     gate = _answerable_gate(question, pages, emit)
     marks["gate"] = time.perf_counter()
-    if JEV_REFUSE and gate is not None and gate < JEV_REFUSE:
-        log.info("Jev answerability %.3f < %.3f — refusing without a reader call",
-                 gate, JEV_REFUSE)
-        emit({"type": "refused", "answerable": gate, "threshold": JEV_REFUSE})
-        result = _done(NO_PAGES_PL, trace, providers.Usage(), 1, reader,
+    verdict = gate.verdict(JEV_REFUSE) if JEV_REFUSE else "ok"
+    if verdict != "ok":
+        log.info("Jev gate refused (%s): answerable=%s scope=%s, threshold %.2f",
+                 verdict, gate.answerable, gate.scope, JEV_REFUSE)
+        emit({"type": "refused", "answerable": gate.answerable,
+              "scope": gate.scope, "verdict": verdict, "threshold": JEV_REFUSE})
+        result = _done(REFUSAL_PL[verdict], trace, providers.Usage(), 1, reader,
                        retrieval, _timings(started, marks))
-        result["answerable"] = gate
-        result["refused"] = True
+        result["answerable"] = gate.answerable
+        result["scope"] = gate.scope
+        result["refused"] = verdict
         return result
 
     def on_text(piece: str) -> None:
@@ -1331,7 +1441,8 @@ def _read_once(reader, question: str, emit, trace: list[dict],
     )
     result = _done(reply.text, trace, reply.usage, reply.steps, reader,
                    retrieval, _timings(started, marks))
-    result["answerable"] = gate
+    result["answerable"] = gate.answerable
+    result["scope"] = gate.scope
     return result
 
 
@@ -1600,6 +1711,21 @@ NO_PAGES_PL = (
     "pytania, więc nie mogę na nie odpowiedzieć. Sprawdź, czy dokument na ten "
     "temat jest w katalogu pdfs/ i czy indeks został przebudowany."
 )
+
+# One refusal used to cover two different failures, and the sentence it showed
+# was wrong for one of them. `jev.Gate` separates them; these are what each one
+# should actually say, because "rebuild your index" is unhelpful advice to
+# someone who asked a door catalogue about engine oil.
+REFUSAL_PL = {
+    "not-in-corpus": (
+        "Te dokumenty dotyczą tego tematu, ale nie zawierają informacji "
+        "potrzebnej do odpowiedzi na to pytanie — nie odpowiadam, zamiast "
+        "zgadywać. Prawdopodobnie potrzebny jest inny dokument (np. cennik "
+        "zamiast karty technicznej)."),
+    "out-of-scope": (
+        "To pytanie dotyczy innej dziedziny niż zaindeksowane dokumenty, "
+        "więc nie ma tu na nie odpowiedzi."),
+}
 
 
 def _page_header(p: dict) -> str:

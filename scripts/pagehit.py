@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 
 VISUAL = "visual"
 LEXICAL = "lexical"
+XRAY = "xray"
 
 
 @dataclass(frozen=True)
@@ -128,3 +129,19 @@ def from_lexical(hit: dict) -> PageHit:
     """
     return PageHit(article_id=hit["article_id"], tile_index=hit["page"] - 1,
                    score=hit["score"], sources=frozenset({LEXICAL}))
+
+
+def from_xray(article_id: int, page: int, score: float) -> PageHit:
+    """A page the exhaustive sweep judged, with its rubric score as the ranking.
+
+    Like `from_lexical` it carries no chunks, and for the same honest reason:
+    the sweep judges a page's text, so it knows the page is relevant and has no
+    opinion about WHERE on it the answer sits. Citations fall back to
+    page-level highlighting, exactly as they do for a BM25-only page.
+
+    `score` goes into both `score` and `norm` because there is only one number
+    here: it is already absolute and already in [0, 1], so there is no
+    per-variant best to divide by and no second retriever to rank-fuse against.
+    """
+    return PageHit(article_id=article_id, tile_index=page - 1,
+                   score=score, norm=score, sources=frozenset({XRAY}))

@@ -28,3 +28,13 @@ undefined/
 # test/build artefacts
 .pytest_cache/
 *.egg-info/
+
+# per-agent tool configs, written by the UBS installer's --easy-mode; they are
+# local tooling preferences, not part of the project
+.codex/
+.continue/
+.cursor/
+.gemini/
+.opencode/
+.claude/settings.json
+.claude/hooks/

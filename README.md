@@ -7,6 +7,10 @@ Thin layer over [PixelRAG](https://github.com/StarTrail-org/PixelRAG): index +
 serve stay upstream; this repo adds page-level retrieval, optional BM25 hybrid,
 citations, and a web UI.
 
+# Jev experiments
+
+[TypeSafe](https://docs.typesafe.ai/) / Jev latency-focused demos. Each app lives in its own top-level directory with its own README, TESTING.md and screenshots.
+
 ![Web UI — answer with citations over the source PDF](playground1.png)
 
 ## PDFS source
@@ -56,18 +60,26 @@ KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 .venv/bin/pixelrag serve \
 
 ## Retrieval modes
 
-Which retriever finds the pages is separate from which reader answers. Five
+Which retriever finds the pages is separate from which reader answers. Seven
 named modes, pickable per question — in the UI header, with `ask.py
 --retrieval`, or as `retrieval=` on `POST /api/ask`:
 
-| Mode | What runs |
-|---|---|
-| `visual` | the pixel index alone — the claim this project exists to test |
-| `hybrid` | visual + BM25 over the PDF text layer, fused by rank (RRF) |
-| `jev-expand` | Jev-chosen phrasings, then `visual` verbatim — no reranker |
-| `jev` | visual candidates, Jev-expanded queries, Jev-reranked chunks |
-| `jev+hybrid` | the same Jev pool, with BM25 page candidates poured into it |
-| `jev-page` | `hybrid`, then Jev reranks the candidate **pages** on full text |
+| Mode | What runs | top-1 |
+|---|---|---|
+| `visual` | the pixel index alone — the claim this project exists to test | 62% |
+| `hybrid` | visual + BM25 over the PDF text layer, fused by rank (RRF) | 85% |
+| `jev-expand` | Jev-chosen phrasings, then `visual` verbatim — no reranker | 62% |
+| `jev` | visual candidates, Jev-expanded queries, Jev-reranked chunks | 77% |
+| `jev+hybrid` | the same Jev pool, with BM25 page candidates poured into it | 77% |
+| `jev-page` | `hybrid`, then Jev reranks the candidate **pages** on full text | **92%** |
+| `xray` | **no retrieval** — every page of the corpus, judged in one call | **92%** |
+
+top-1 is `scripts/bench.py --verified`, k=4, on the 13 questions whose gold page
+is decided by literal string match rather than by a model. `jev-page` is the
+default when a key is present; see
+[Does the reranker earn its bill?](#does-the-reranker-earn-its-bill--answered-the-page-one-does-the-chunk-one-does-not)
+for why it is not `jev`, and why `jev-expand` is kept despite scoring what
+`visual` scores.
 
 The two Jev modes also return an **answerability** score: does the retrieved
 content actually contain an answer, independent of how it ranked. Ranking always
@@ -77,14 +89,16 @@ produces a rank 1, so no score can say "nothing here answers this" — see
 `jev-expand` exists to make one subtraction possible: Jev's two stages cost
 about 500 input tokens and about 11k respectively, and they used to be
 purchasable only as a pair, so "is the reranker earning its bill" had no
-experiment. `visual → jev-expand → jev` isolates one stage per step.
+experiment. `visual → jev-expand → jev` isolates one stage per step — and the
+subtraction has now been done. **`jev-expand` scores exactly what `visual`
+scores**, so the expansion stage is measured dead weight and the mode is kept
+only to keep proving it.
 
-`auto` (the default everywhere) resolves to `hybrid` where the text sidecar
-exists and `visual` otherwise. **A TYPESAFE_API_KEY makes the Jev modes
-selectable; it does not make one the default** — `PIXELRAG_JEV=1` does that.
-Jev adds two sequential round trips (~1.9s against ~20ms) for a benefit one
-verified question supports and no question set has measured, and the mode that
-runs by default should be the measured one.
+`auto` resolves to `jev-page` when a key is present, and to `hybrid`/`visual`
+otherwise. It used to resolve to `jev`/`jev+hybrid`; it does not any more,
+because `jev` is beaten by `hybrid` on the question set at 300x the latency.
+`PIXELRAG_JEV=manual` keeps the Jev modes selectable without defaulting to them,
+and `PIXELRAG_JEV=0` stops TypeSafe being called at all.
 
 The flags are deliberately asymmetric in the other direction too: naming
 `hybrid` explicitly turns BM25 on regardless of `PIXELRAG_HYBRID`, since the
@@ -108,6 +122,8 @@ reader**. Only two slots differ:
 | `jev-expand` | **Jev** | pixel faiss | — | 1 |
 | `jev` | **Jev** | pixel faiss | **Jev** | 2 |
 | `jev+hybrid` | **Jev** | pixel faiss + BM25 **into the same pool** | **Jev** | 2 |
+| `jev-page` | local regex strip | pixel faiss + BM25, fused by RRF | **Jev, on whole pages** | 1 |
+| `xray` | — (none searched) | **none** — the text sidecar is read whole | **Jev, on every page** | 1 |
 
 `hybrid` fuses BM25 as a second voter. `jev+hybrid` instead pours BM25's pages
 into the candidate pool as extra chunks for Jev to score — so it is not "hybrid
@@ -189,6 +205,10 @@ and the reader is the part that bills.
 | `PIXELRAG_JEV_DEPTH` | `24` | chunks pulled per phrasing before the rerank |
 | `PIXELRAG_JEV_POOL` | `64` | chunks scored in one rerank call |
 | `PIXELRAG_JEV_PAGES` | `16` | candidate pages scored by `jev-page` |
+| `PIXELRAG_XRAY_BUDGET` | `48000` | input tokens per `xray` shard; under Jev's 64k window |
+| `PIXELRAG_XRAY_SHARDS` | `8` | above this the corpus is too big to sweep and `xray` refuses |
+| `PIXELRAG_XRAY_PAGE_CHARS` | `6000` | per-page truncation inside a sweep |
+| `PIXELRAG_ORACLE_GOLD` | `0.66` | score at which a page becomes gold in the generated set |
 | `PIXELRAG_CHUNK_CONTEXT` | `0` | chars of the page's head prepended to each crop's text |
 | `TYPESAFE_API_KEY` | — | enables `jev` / `jev+hybrid` |
 | `TYPESAFE_MODEL` | `jev-latest` | Jev model |
@@ -271,14 +291,20 @@ better when PDFs have a text layer; turn it on with `PIXELRAG_HYBRID=1`.
 | `scripts/imagefit.py` | downscale pages to what the reader actually bills |
 | `scripts/answer_cache.py` | reuse answers for near-identical questions |
 | `scripts/lexical.py` | BM25 over PDF text |
+| `scripts/xray.py` | the whole corpus, every question, in one call |
+| `scripts/oracle.py` | builds and labels `eval/questions_pl.yaml` |
+| `scripts/bench.py` | every mode over that set; `--verified` for a non-circular referee |
+| `scripts/calibration.py` | order-invariance and OOD calibration; the bar for any replacement |
 | `scripts/citations.py` | quote → highlight rectangles |
 | `scripts/snip.py` | crop a page around a citation, for chat inline |
 | `scripts/app.py` + `static/` | web UI |
 | `tests/` | the pure logic, runnable with no services and no API key |
-| `eval/` | place for a fresh question set when you rebuild one |
+| `eval/` | the generated question set (`scripts/oracle.py`) |
 
 `scripts/evaluate.py` / `evaluate_pl.py` / `answer_all.py` expect YAML under
-`eval/` — add questions there when you want measured recall again.
+`eval/`. `scripts/oracle.py` generates it from the corpus, `scripts/bench.py`
+reads it for a per-mode comparison, and `evaluate_pl.py` runs against it for the
+first time since the corpus behind its old ground truth was replaced.
 
 ## Tests
 
@@ -419,6 +445,44 @@ fit it. Keyword retrieval sees the word; the gate reads what it means.
 In a Jev retrieval mode you get both numbers, and the pair is a diagnosis: high
 over the pool and low at the gate means retrieval found the answer and ranking
 lost it.
+
+##### One number could not tell two failures apart
+
+The gate asked one Noul and routed on it. Measured over this index:
+
+| question | `answerable` | `scope` |
+|---|---|---|
+| kolory tkanin soltis | 0.68 | 0.81 |
+| Ile kosztuje brama Connect? | **0.04** | **0.64** |
+| Jak wymienić olej w silniku? | **0.01** | **0.05** |
+
+On answerability alone the last two rows are the same event — 0.04 against 0.01
+is not a distinction anyone should route on. They are not the same event. One
+asked a door catalogue for a price it does not print; the other asked a door
+catalogue about engine oil. The first is a corpus that should be extended, and
+the user should be told what *is* here; the second is a question that was never
+going to work. `scope` is the only field that separates them, and it costs about
+**forty input tokens**, because the page text is already in that request.
+
+This is the RAG form of a result TypeSafe's own docs make about Choice: a
+relative judgment always points at *something*, so it cannot report that
+everything on offer is wrong. Answerability is absolute about the pages and
+still cannot report that the whole corpus is the wrong one.
+
+So `jev.gate()` returns both, and a refusal says which it was:
+
+| verdict | what the user is told |
+|---|---|
+| `not-in-corpus` | these documents are about this, but do not carry the answer — you probably want a different document (a cennik, not a karta techniczna) |
+| `out-of-scope` | this question is about another domain entirely |
+
+`out-of-scope` is tested first and against a fixed 0.5, not against the caller's
+threshold: tightening the answerability gate must not silently start
+reclassifying near-misses as wrong-library.
+
+Measured by `scripts/bench.py` over the 10 generated questions this corpus
+cannot answer: **10/10 refused.** No amount of better retrieval reaches that
+number, because ranking always returns a rank 1.
 
 `PIXELRAG_JEV_REFUSE=<0..1>` refuses below that threshold without calling the
 reader — **0 (off) by default**. It emits `answerable` and `refused` events
@@ -595,17 +659,281 @@ Which is the honest summary of the whole question: **chunks give precision about
 where an answer sits, pages give attribution about what it is about, and neither
 subsumes the other.** Three questions cannot choose between them.
 
-#### Does the reranker earn its bill? — still open
+### `xray` — when the corpus is small enough not to retrieve at all
 
-The reranker is not a no-op: `jev` and `jev-expand` disagreed on 6/6 questions.
-It won the one case with verified ground truth — "co to jest pergola?", where it
-moved the definitional page from rank 3 to rank 1 and every other mode left it
-at 3 or missed it. Expansion alone moved the page set on 2/6 and, given a colour
-facet, spent the reader's page budget on the wrong catalogue.
+38 pages of this index are **31,298 input tokens**. Jev's window is 64k. So the
+whole corpus fits in one request, and scoring every page of it against a query
+costs **1.3 s and $0.0013** — under a quarter of one reader call (~6,200 ms,
+~5,700 image tokens at roughly 7x the rate per token).
 
-That is one verified win, no verified losses, and a great deal of unverifiable
-churn. It stays open until there is a question set whose answers are in this
-index.
+Which reframes the funnel: on a corpus this size, the entire retrieval pipeline
+exists to avoid doing something cheaper than the call it is protecting.
+
+Three properties follow, and they are why this is a module and not a flag:
+
+1. **Recall stops being a variable.** Every page is scored, so no page can fall
+   below a cut. Measured: 100% recall, the only mode that reaches it. `xray`
+   cannot *miss* a page, only rank it badly — one failure mode instead of three.
+2. **The scores are absolute.** A rubric level means the same thing in every
+   request, unlike cosine or BM25 which only compare within one query. That is
+   what makes sharding sound, and it makes the score distribution itself a
+   signal: for a question this corpus cannot answer the top page scores
+   **0.24/1** rather than 0.81/1 — a fact ranking destroys, since sorting always
+   yields a rank 1.
+3. **Extra judgments are nearly free.** Measured: seven more questions over the
+   same state cost **293 input tokens total**, ~42 each — the tokens of the
+   question text, because the state is sent once and output tokens are unbilled.
+
+So the sweep asks what ranking could never afford to. Every `xray` query returns,
+in the same request as the ranking:
+
+| facet | what it is for |
+|---|---|
+| `answerable` | is the answer anywhere in the corpus |
+| `scope` | is the question about this library at all |
+| `premise` | does the corpus *contradict* something the query asserts |
+| `injection` | is the query trying to steer the system rather than ask it |
+| `kind` | price / spec / procedure / catalogue — what is being asked for |
+| `granularity` | value / passage / survey — how many pages the answer needs |
+
+**The ceiling is real and the module refuses to hide it.** 824 tokens per page
+here means ~72 pages per request. Past that the corpus is sharded into
+concurrent calls — same wall clock, multiplied bill — and past `MAX_SHARDS` it
+refuses outright, because "exhaustive" is the only claim it makes and a partial
+sweep is not a cheaper version of it. A 10,000-page corpus needs retrieval, and
+that is what the other six modes are. `xray` is a mode at 38 pages and a
+benchmark at 3,800.
+
+A sweep that lost a shard still returns pages and still looks like a sweep, so
+`exhaustive: false` and `unjudged` are in the stats, and the note lands on the
+trace line and every comparison row.
+
+### Where the question set comes from
+
+Everything above depends on `eval/questions_pl.yaml`, which for most of this
+repo's life did not exist — `evaluate_pl.py` could not run at all, and every
+retrieval figure in it was measured against a corpus this index no longer
+contains. `scripts/oracle.py` builds one in three stages, and the split between
+them is the design:
+
+1. **Mine, in code, free.** Headings are spans of page text, so finding them is
+   string work. Running headers ("KARTA TECHNICZNA", on all 11 pages of article
+   0) and wrapped sentences are dropped by rules — *"appears on 27 of 27 pages"*
+   is a fact, and asking a model about it would be paying for arithmetic.
+2. **Select the question, with Jev.** Four Polish phrasings per subject are
+   generated locally; Jev picks which one the subject invites, and judges
+   whether the subject is a real thing, specific enough to have one answer, and
+   a physical product. No page text is sent — none is needed to judge a
+   sentence.
+3. **Label, with the X-ray.** Gold is whatever the *corpus* answers with, not
+   the page the heading came from.
+
+Run: `.venv/bin/python scripts/oracle.py --limit 44` — **33 questions in 14 s
+for $0.054.**
+
+**The negative class is discovered, not asserted.** For subjects Jev confirms
+are physical products, the builder also emits `Ile kosztuje "X"?` and
+`Jak zamontować "X"?` and lets the X-ray decide. On this corpus they come back
+unanswerable — 10 of the 33 — which is the README's own day-one discovery
+(*"this index contains no prices"*) reproduced automatically, per question, as
+labelled data. They are the hardest negatives available: well-formed, in scope
+(`scope` 0.84-0.95), about a product demonstrably in the corpus, and still
+unanswerable.
+
+Four checks keep the labels honest, and each exists because the first run got
+something wrong:
+
+| check | what it caught |
+|---|---|
+| both judgments must agree | `Ile kosztuje "WAGA PERGOLI WOLNOSTOJĄCEJ"?` — a weight table cleared the gold threshold in a corpus with no prices, while the Noul in the same response said 0.1 |
+| gold must contain the subject | `HI MARINA HORIZON — jakie są parametry techniczne?` was labelled onto a garage-door dimensions table; the string occurs on exactly one page and it is not that one |
+| the negative class is led by the Noul | a price question about a real product still scores "related topic" on its own pages, so the Score can never say "nothing answers this" and every probe landed in the unsure band |
+| soft hyphens are normalised | the text layer carries U+00AD inside wrapped words, so a heading failed to match itself |
+
+**What this oracle is not evidence for**, stated in the generated file itself
+rather than a footnote: the labels come from Jev reading page text, so `jev`,
+`jev-page` and `xray` are partly self-marked. `bench.py --verified` is the
+answer — it keeps only questions whose subject string occurs on exactly one page
+and makes that page the gold, so `str.__contains__` decides and no mode is
+circular. **13 of 23 qualify, and the Jev oracle independently agreed with the
+string on 12 of them.** That 12/13 is the only evidence in this repo that the
+oracle is worth anything, and it is why the tables above quote `--verified`.
+
+#### Does the reranker earn its bill? — answered: the page one does, the chunk one does not
+
+This was open for one reason — there was no question set. `scripts/oracle.py`
+builds one (see [Where the question set comes from](#where-the-question-set-comes-from)),
+`scripts/bench.py` runs every mode over it, and `--verified` restricts it to the
+13 questions whose gold page is decided by **literal string match**, so no mode
+is graded by its own model. At `k=4`:
+
+| mode | top-1 | recall | cover | ms | $/q |
+|---|---|---|---|---|---|
+| `visual` | 62% | 92% | 92% | 194 | $0 |
+| `jev-expand` | **62%** | 92% | 92% | 878 | $0.00004 |
+| `jev` | 77% | 92% | 92% | 1846 | $0.00064 |
+| `hybrid` | **85%** | 92% | 92% | **6** | **$0** |
+| `jev-page` | **92%** | 92% | 92% | 1109 | $0.00088 |
+| `xray` | **92%** | **100%** | **100%** | 1288 | $0.0024 |
+
+Three findings, and two of them retire a stage:
+
+**Expansion buys nothing.** `jev-expand` scores exactly what `visual` scores on
+every column, for +684 ms. Not "a small gain we cannot resolve" — the same
+number. The reason is visible in the funnel above it: recall is already 92-100%
+before Jev is called, so there is nothing left for a wider query to recover.
+The README already measured this from the other end — widening the candidate
+pool 2.3x also changed nothing, because *"widening pays when recall is the
+constraint. Here it is saturated."* Expansion is the same medicine for the same
+absent disease.
+
+**Chunk reranking loses to BM25.** `jev` at 77% is beaten by `hybrid` at 85%,
+which is free and 300x faster. That is not a close call, and it is the
+`kolory tkanin soltis` finding generalised: the 875x1024 grid severs headings
+from the tables they head, so crop text is the worst unit in the system and
+Jev is being asked to judge an artifact of the image grid.
+
+**The unit is the whole finding.** Sorted by how much text travels together:
+
+| unit given to the ranker | top-1 |
+|---|---|
+| 875x1024 crop text (`jev`) | 77% |
+| whole page, BM25 (`hybrid`) | 85% |
+| whole page, Jev (`jev-page`) | 92% |
+| whole corpus, Jev (`xray`) | 92% |
+
+Monotone. **Jev is good exactly when it reads the unit a person would read**,
+and pixel retrieval is what had been choosing that unit for it.
+
+So `default_retrieval()` now returns `jev-page` rather than `jev`/`jev+hybrid`.
+`jev-expand` stays in the mode list, unblocked and never default, because it is
+the control that proves the subtraction — a stage removed without a mode to
+re-run is a claim, not a measurement.
+
+##### And a routing layer would not help either
+
+The obvious next move is to pick a mode per question. Measured, per question,
+over the same 13: **the ceiling for a perfect oracle router is 12/13 — which is
+what `jev-page` and `xray` already score on their own.** There is no question
+that only `visual` or only `hybrid` gets right. The one nobody gets is the one
+where the string-verified gold and the Jev oracle disagree about which of two
+continuation pages is the answer, so it may not be a retrieval failure at all.
+
+A router is worth building when the modes disagree usefully. Here they agree,
+and the best single mode is already at the ceiling.
+
+#### The two things open replications do not reproduce — tested
+
+The community result on open Jev reimplementations is that ~80% of the value
+needs no training: read next-token logits over the allowed labels instead of
+decoding JSON, and any open model does it. What replications are reported *not*
+to reproduce is **OOD calibration** and **option-order robustness**.
+
+That is not trivia for this repo, it is the invoice. Ranking — the half logits
+commoditise — is worth +7 top-1 over free BM25 here. The gate — which runs
+entirely on calibration — breaks even at 1 unanswerable question in 381. **The
+half you could self-host is the half barely worth paying for; the half carrying
+the return is precisely the half replications are said to miss.**
+
+So `scripts/calibration.py` tests both claims directly:
+
+```sh
+.venv/bin/python scripts/calibration.py            # both, ~30 s, ~$0.05
+```
+
+**Claim 1 — option-order robustness.** Every page scored twice, the second time
+with the rubric written backwards and the result mirrored back:
+
+| | |
+|---|---|
+| mean drift | **0.061 on a 0-3 scale (2.0%)** |
+| max drift | 0.32 |
+| top-1 unchanged | 7/8 |
+| top-3 set unchanged | 7/8 |
+
+If this drifted, every threshold in this repo would be an artifact of criteria
+order — the gate, the oracle's gold cut, `jev-page`'s ranking. It does not.
+
+**Claim 2 — OOD calibration.** All 33 generated questions plus 8 supplied
+out-of-domain ones, judged against the whole corpus:
+
+| declared | n | actually answerable |
+|---|---|---|
+| 0.1 | 18 | **0.00** |
+| 0.5 | 2 | 1.00 |
+| 0.7 | 10 | 1.00 |
+| 0.9 | 11 | 1.00 |
+
+| signal | graded against | AUC | medians |
+|---|---|---|---|
+| `answerable` | 23 answerable vs 18 not | **1.00** | 0.79 vs 0.045 |
+| `scope` | 33 in-domain vs 8 out | **1.00** | 0.90 vs 0.025 |
+
+Perfect separation on both, with no overlap at all.
+
+**The operating point, which is the number to set `PIXELRAG_JEV_REFUSE` from:**
+
+| gate at | coverage | correct | wrongly refused |
+|---|---|---|---|
+| 0.1 | 68% | 82% | 0 |
+| **0.3** | **56%** | **100%** | **0** |
+| 0.5 | 56% | 100% | 0 |
+| 0.7 | 41% | 100% | **6** |
+| 0.9 | 17% | 100% | 16 |
+
+**0.3 to 0.5 is the plateau: 56% of traffic answers itself, all of it correctly,
+and nothing answerable is turned away.** Above 0.7 it starts refusing questions
+the corpus could have answered, which is the column that costs a customer.
+
+##### Why `scope` needed questions the oracle cannot write
+
+The first run scored `scope` at **AUC 0.51 — a coin flip** — and that was the
+test's fault, not the signal's. Every question in `eval/questions_pl.yaml` is
+mined *from* this corpus, so all of them are in scope by construction, including
+all ten negatives: they are price and installation questions about products
+that are demonstrably here (`scope` 0.84-0.95). Grading `scope` on answerability
+asks it to separate a class that is not in the data.
+
+`calibration.OUT_OF_DOMAIN` supplies the missing class — eight fluent, specific
+Polish questions from other domains (engine oil, ZUS contributions, risotto).
+With a negative class to separate, `scope` scores 1.00. **An oracle that reads
+the corpus cannot invent out-of-domain questions; they are the one input this
+measurement needs a human for**, and leaving them out silently turns a working
+signal into a failing number.
+
+##### This is also the acceptance test for replacing Jev
+
+Point `calibration.py` at any candidate — a local logit reader over an open
+model, another vendor — and it answers "is this good enough to swap in" with the
+same two numbers. The bar the hosted model set here is **AUC 1.00 on both
+signals and 2% order drift**. That is what a replication has to clear before the
+ranking savings mean anything.
+
+#### Does Jev work with pixel RAG at all?
+
+Worth stating plainly, because the answer is partly no and the repo is named
+after the part that is.
+
+**Jev never sees a pixel.** It is [text-only](https://docs.typesafe.ai/models.md);
+every call this repo makes sends `{"query": …}`, `{"query", "pages"}` or
+`{"query", "chunks"}`. In a pixel-retrieval system Jev does not judge the
+retrieved evidence — it judges a *text shadow* of it, extracted from the PDF
+layer at coordinates the pixel index chose. Two consequences that the table
+above is measuring without naming:
+
+- The geometry is hostile. A crop rectangle is a good unit for an image encoder
+  and a bad one for a reader, and `jev` at 77% is what that costs.
+- On a corpus of scans there is no shadow at all and every Jev stage degrades
+  to nothing, which is exactly the corpus `visual` exists for.
+
+What Jev does add is the thing neither pixels nor BM25 can produce at any price:
+a **typed judgment about the question** rather than a ranking of documents.
+Answerability, scope, premise. The gate below refuses 10/10 of the questions
+this corpus cannot answer; no amount of better retrieval reaches that number,
+because ranking always returns a rank 1.
+
+**The short version: use Jev for the judgment layer and for page-level ranking;
+do not use it to expand a query, and do not feed it crops.**
 
 #### A single unreadable crop used to abort the whole stage
 

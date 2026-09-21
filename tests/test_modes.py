@@ -65,8 +65,12 @@ def test_auto_is_whatever_the_two_flags_ask_for(monkeypatch, wired):
     monkeypatch.setattr(rag, "HYBRID", True)
     assert rag.resolve_retrieval(None) == "hybrid"
     # A key makes a Jev mode the default; `manual` keeps it selectable only.
+    # The Jev default does NOT depend on PIXELRAG_HYBRID any more: `jev-page`
+    # runs BM25 to build its own candidate pool, so there is no hybrid variant
+    # of it to choose between. See rag.default_retrieval for the measurement
+    # that moved this off `jev`/`jev+hybrid`.
     monkeypatch.setenv("TYPESAFE_API_KEY", "k")
-    assert rag.resolve_retrieval("") == "jev+hybrid"
+    assert rag.resolve_retrieval("") == "jev-page"
     monkeypatch.setenv("PIXELRAG_JEV", "manual")
     assert rag.resolve_retrieval("") == "hybrid"
     assert rag.retrieval_blocked("jev+hybrid") is None     # still selectable
@@ -74,7 +78,7 @@ def test_auto_is_whatever_the_two_flags_ask_for(monkeypatch, wired):
     assert "PIXELRAG_JEV" in rag.retrieval_blocked("jev+hybrid")
     monkeypatch.delenv("PIXELRAG_JEV")
     monkeypatch.setattr(rag, "HYBRID", False)
-    assert rag.default_retrieval() == "jev"
+    assert rag.default_retrieval() == "jev-page"
 
 
 def test_an_unknown_mode_is_refused_rather_than_guessed(wired):
@@ -123,7 +127,7 @@ def test_stats_count_the_funnel_that_actually_happened(wired):
     assert stats["unique_chunks"] == 3                     # without
     assert stats["candidate_pages"] == 2
     assert stats["pages"] == 2 and stats["ranked_pages"] == 2
-    assert stats["cost_usd"] == 0.0                        # no paid API at all
+    assert stats["cost_usd"] == 0.0  # ubs:ignore — literal 0.0, not arithmetic: no paid API at all
     assert stats["ms"] >= 0 and stats["lexical_hits"] == 0
 
 
