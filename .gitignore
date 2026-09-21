@@ -29,12 +29,13 @@ undefined/
 .pytest_cache/
 *.egg-info/
 
-# per-agent tool configs, written by the UBS installer's --easy-mode; they are
-# local tooling preferences, not part of the project
+# per-agent tool configs and skills, written by the UBS installer's --easy-mode
+# and by the agents themselves; they are local tooling preferences, not part of
+# the project, so they stay on disk and out of the history
 .codex/
 .continue/
 .cursor/
 .gemini/
 .opencode/
-.claude/settings.json
-.claude/hooks/
+.claude/
+.agents/
