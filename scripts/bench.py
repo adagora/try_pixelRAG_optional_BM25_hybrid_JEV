@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -41,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import corpus
 import jev
 import rag
 
@@ -85,7 +87,48 @@ def load(path: Path = EVAL) -> list[Question]:
 
 
 def title_to_id() -> dict[str, int]:
-    return {a["title"]: i for i, a in enumerate(rag.articles())}
+    return {a["title"]: i for i, a in enumerate(corpus.articles())}
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% confidence interval on a proportion, Wilson score.
+
+    Not the textbook normal interval: at n=13 and p near 1.0 that one produces
+    bounds above 100% and is simply wrong at the end of the scale this table
+    lives at. Wilson stays inside [0, 1] and does not collapse to zero width
+    when a mode gets everything right.
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def mcnemar(a: dict[str, bool], b: dict[str, bool]) -> tuple[int, int, float]:
+    """Exact two-sided McNemar on two modes' per-question top-1 outcomes.
+
+    THE ONLY COMPARISON THAT MEANS ANYTHING BETWEEN TWO ROWS OF THIS TABLE.
+    Both modes answer the SAME questions, so the interesting count is not how
+    many each got right but on how many they disagreed: the questions both got
+    right carry no information about which is better, and neither do the
+    questions both got wrong. Only the discordant pairs do, and there are
+    usually one or two of them.
+
+    Returns (a-wins, b-wins, p). p is the exact binomial sign test on the
+    discordant pairs — no chi-square approximation, which needs counts this
+    question set will never have.
+    """
+    shared = a.keys() & b.keys()
+    wins_a = sum(1 for q in shared if a[q] and not b[q])
+    wins_b = sum(1 for q in shared if b[q] and not a[q])
+    n = wins_a + wins_b
+    if n == 0:
+        return (0, 0, 1.0)
+    tail = sum(math.comb(n, i) for i in range(min(wins_a, wins_b) + 1))
+    return (wins_a, wins_b, min(1.0, 2 * tail / (2 ** n)))
 
 
 def _subject(question: str) -> str:
@@ -160,6 +203,10 @@ class Result:
     cost: float = 0.0
     errors: int = 0
     misses: list[tuple[str, list]] = field(default_factory=list)
+    # question -> did this mode put the gold page at rank 1. Kept per question
+    # rather than summed, because comparing two modes needs to know WHICH ones
+    # they disagreed about — see mcnemar().
+    per_q: dict[str, bool] = field(default_factory=dict)
 
     @property
     def ms(self) -> float:
@@ -168,16 +215,25 @@ class Result:
 
     def as_dict(self) -> dict:
         pct = lambda n, d: round(100 * n / d, 1) if d else None  # noqa: E731
+        lo, hi = wilson(self.top1, self.scored)
         return {"mode": self.mode, "blocked": self.blocked,
                 "questions": self.scored,
                 "top1": pct(self.top1, self.scored),
+                "top1_n": self.top1,
+                "top1_ci95": [round(100 * lo, 1), round(100 * hi, 1)],
                 "recall": pct(self.recall, self.scored),
                 "coverage": pct(self.covered, self.gold_total),
                 "ceiling": pct(self.ceiling, self.gold_total),
                 "refused": pct(self.refused, self.negatives),
                 "negatives": self.negatives,
                 "median_ms": self.ms, "cost_usd": round(self.cost, 5),
-                "errors": self.errors, "circular": self.mode in CIRCULAR}
+                "errors": self.errors, "circular": self.mode in CIRCULAR,
+                # Per question, so two --json runs made at different times (or
+                # at different budgets) can be compared pairwise offline. A
+                # mode costs real money per run; re-running one only to learn
+                # which questions it disagreed with another about is a bill
+                # this field exists to avoid.
+                "per_question": self.per_q}
 
 
 def run_mode(mode: str, questions: list[Question], k: int,
@@ -225,7 +281,10 @@ def run_mode(mode: str, questions: list[Question], k: int,
             result.covered += len(hit)
             if hit:
                 result.recall += 1
-            if q.primary is not None and got and got[0] == (aid, q.primary):
+            is_top1 = bool(q.primary is not None and got
+                           and got[0] == (aid, q.primary))
+            result.per_q[q.q] = is_top1
+            if is_top1:
                 result.top1 += 1
             elif not hit:
                 result.misses.append((q.q, got))
@@ -245,8 +304,8 @@ def run_mode(mode: str, questions: list[Question], k: int,
 
 
 def table(results: list[Result]) -> str:
-    head = (f"{'mode':<11} {'top-1':>7} {'recall':>7} {'cover':>7} "
-            f"{'ceil':>6} {'refuse':>7} {'ms':>7} {'$/q':>9}")
+    head = (f"{'mode':<11} {'top-1':>7} {'95% CI':>11} {'recall':>7} "
+            f"{'cover':>7} {'ceil':>6} {'refuse':>7} {'ms':>7} {'$/q':>9}")
     lines = [head, "-" * len(head)]
     for r in results:
         if r.blocked:
@@ -256,11 +315,53 @@ def table(results: list[Result]) -> str:
         star = "*" if d["circular"] else " "
         cost = f"{r.cost / r.scored:.5f}" if r.scored else "0"
         refuse = "—" if d["refused"] is None else f"{d['refused']:.0f}%"
+        lo, hi = d["top1_ci95"]
+        ci = f"[{lo:.0f}-{hi:.0f}]" if r.scored else "—"
         lines.append(
-            f"{r.mode:<11}{star}{d['top1'] or 0:6.0f}% {d['recall'] or 0:6.0f}% "
+            f"{r.mode:<11}{star}{d['top1'] or 0:6.0f}% {ci:>11} "
+            f"{d['recall'] or 0:6.0f}% "
             f"{d['coverage'] or 0:6.0f}% {d['ceiling'] or 0:5.0f}% "
             f"{refuse:>7} {r.ms:6.0f} {cost:>9}")
     return "\n".join(lines)
+
+
+def resolution(results: list[Result]) -> str:
+    """Which differences in the table above are differences, and which are one
+    question.
+
+    THIS BLOCK EXISTS BECAUSE THE TABLE IS PERSUASIVE AND THE QUESTION SET IS
+    SMALL. At n=13 a single question is 7.7 points, so two rows seven points
+    apart differ by one question and a row ordering is not a ranking. Every
+    pair is tested head to head on the questions they disagreed about, which is
+    the only evidence in the table about which mode is better.
+    """
+    scored = [r for r in results if not r.blocked and r.per_q]
+    if len(scored) < 2:
+        return ""
+    n = max(r.scored for r in scored)
+    step = 100.0 / n if n else 0.0
+    out = [f"\nResolution: {n} questions, so one question is {step:.1f} points.",
+           ("Head to head on the questions two modes disagreed about "
+            "(exact McNemar):"), ""]
+    best = max(scored, key=lambda r: r.top1)
+    for r in scored:
+        if r is best:
+            continue
+        wins_b, wins_r, p = mcnemar(best.per_q, r.per_q)
+        disc = wins_b + wins_r
+        if disc == 0:
+            verdict = "identical on every question"
+        elif p > 0.05:
+            verdict = f"p={p:.3f} — not resolved by this set"
+        else:
+            verdict = f"p={p:.3f} — resolved"
+        out.append(f"  {best.mode:<11} vs {r.mode:<11} "
+                   f"{wins_b}-{wins_r} of {disc:>2} discordant   {verdict}")
+    out.append("\n  A row that beats another by one or two questions has not "
+               "been shown to be\n  better than it. Widen eval/questions_pl.yaml "
+               "(scripts/oracle.py) before\n  reading a winner out of the "
+               "ordering.")
+    return "\n".join(out)
 
 
 def main() -> None:
@@ -302,15 +403,28 @@ def main() -> None:
                                 gate=not args.no_gate))
 
     if args.json:
+        # Every pair, not just each against the best. The printed block stays
+        # short because a terminal table is read top to bottom; the JSON is
+        # read by something that wants the whole matrix.
+        scored = [r for r in results if not r.blocked and r.per_q]
+        pairs = []
+        for i, a in enumerate(scored):
+            for b in scored[i + 1:]:
+                wins_a, wins_b, p = mcnemar(a.per_q, b.per_q)
+                pairs.append({"a": a.mode, "b": b.mode, "a_wins": wins_a,
+                              "b_wins": wins_b, "discordant": wins_a + wins_b,
+                              "p": round(p, 4)})
         print(json.dumps({"k": args.pages, "questions": len(questions),
                           "answerable": positives,
-                          "rows": [r.as_dict() for r in results]},
+                          "rows": [r.as_dict() for r in results],
+                          "resolution": pairs},
                          ensure_ascii=False, indent=2))
         return
 
     print(f"\n{positives} answerable questions, "
           f"{len(questions) - positives} the corpus cannot answer, k={args.pages}\n")
     print(table(results))
+    print(resolution(results))
     if args.verified:
         agreed = sum(1 for q in questions if q.oracle.get("agreed"))
         print(f"\n  gold decided by literal string match, not by a model — "
