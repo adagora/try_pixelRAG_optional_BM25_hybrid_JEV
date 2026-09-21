@@ -31,12 +31,16 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 import answer_cache
 import chunkmeta
+import citeparse
+import corpus
 import encoder_device
 import imagefit
 import jev
 import layout
 import pagehit
+import prompts
 import providers
+import queryembed
 import xray
 
 # This system degrades rather than fails, in six separate places: the encoder
@@ -75,9 +79,10 @@ SEARCH_API = "http://127.0.0.1:30001"
 # Where the index lives, and the only thing that knows how it is laid out.
 # Anchored to the repo root, so a CLI invoked from another directory still finds
 # it — see layout.py.
-LAYOUT = layout.DEFAULT
-INDEX_DIR = LAYOUT.index_dir
-TILES_DIR = LAYOUT.tiles_dir
+# Where the index is lives in corpus.py — one owner, so redirecting it at a
+# test index redirects every accessor rather than half of them.
+INDEX_DIR = corpus.INDEX_DIR
+TILES_DIR = corpus.TILES_DIR
 MAX_STEPS = 10
 # Ask modes — both PixelRAG-native:
 #   oneshot  search → attach top page screenshots → one VLM call (default)
@@ -142,254 +147,27 @@ def list_models(provider: str | None = None) -> list[str]:
     return providers.reader_for(provider).models()
 
 
-SYSTEM = """You answer questions about a manufacturing company's own documentation
-(gates, doors, and components) by *reading screenshot tiles* of its catalogues,
-price lists, and technical manuals. Documents may be in Polish — answer in the
-language the question was asked in.
-
-You cannot see any document until you look at it. Never answer from memory or
-from general knowledge about gates and pricing.
-
-How to work (keep the loop short — every tool round trip re-sends every image):
-1. Call pixelrag_search ONCE with a short descriptive query. Prefer the
-   document's own vocabulary over the user's phrasing.
-2. From the hits, pick the 2–4 regions you need and call pixelrag_tile for ALL
-   of them in the SAME turn (parallel tool calls). Do not open one region,
-   wait, then open another unless the first batch was wrong.
-3. Never re-open a (page, region) you have already seen. If the cell is still
-   unclear, open a *different* neighbouring region, or answer that you cannot
-   read it confidently.
-4. Answer as soon as the tiles show the figure. Typical price question: 1 search
-   + 2–3 tiles + answer — about 3 round trips, not 8+.
-
-Reading a tile: each tile is one region of a page, not a whole page. Search
-results give you `available` — the valid page:region ranges per article, e.g.
-"1:0-5,2:0-5" means page 1 has regions 0-5. Regions run left-to-right then
-top-to-bottom, so on a two-column split region 0 is top-left, region 1 is
-top-right, region 2 is middle-left, and so on. Use that to navigate deliberately.
-
-Price matrices — the most common task, and the easiest to get wrong:
-- These tables index gate HEIGHT down the left edge and gate WIDTH across the
-  top, both as "up to and including" (Polish: "do") thresholds in mm. A
-  2350 x 3050 mm gate uses the 2400 row and the 3100 column, not 2300/3000.
-- The axis headers and the cell you want are usually in DIFFERENT regions.
-  Open the header region and the cell region together in one turn, then count
-  rows and columns across the two. Say which row and column header you landed
-  on so the user can check you.
-- Cells often carry TWO values: the unshaded one is the standard RAL colour
-  price, the shaded one is the wood-decor (zloty dab, orzech) price. State which.
-- Prices are net; VAT is added per the page footer. Say so when quoting.
-
-If the tiles do not contain the answer, or the text is too small to read with
-confidence, say exactly that. Never guess a price, dimension, or part number —
-a wrong number quoted to a customer is expensive. Naming the digits you are
-unsure about is far more useful than a confident wrong answer.
-
-Be decisive: stop searching once you have the answer, and lead with it."""
-
-# One-shot reader: images are already attached; no tools.
-#
-# Written against failures observed on price-list / options-table corpora,
-# in rough order of how often they burned an answer:
-#   1. quoting one price when the option is priced per product family
-#   2. reading an options-table price out of the wrong family column
-#   3. answering a question the corpus does not cover, from a nearby document
-#   4. silently picking one drive/variant when the question named none
-ONESHOT_SYSTEM = """Odpowiadasz na pytania o dokumentację techniczną i cenniki
-producenta bram, drzwi i okien, czytając ZAŁĄCZONE ZRZUTY STRON (PixelRAG).
-
-JĘZYK: odpowiadaj w języku pytania. Pytanie po polsku → odpowiedź po polsku.
-
-DOWODY: obrazy są jedynym źródłem. Nigdy nie odpowiadaj z pamięci ani z ogólnej
-wiedzy o bramach. Jeśli na stronach nie ma odpowiedzi — powiedz to wprost i
-napisz, czego dokument nie zawiera. Nie zgaduj ceny, wymiaru ani numeru części:
-błędna liczba podana klientowi jest kosztowna. Lepiej wskazać, których cyfr nie
-jesteś pewien, niż podać pewną, ale złą wartość.
-
-RODZINA PRODUKTU — najczęstsze źródło błędnych odpowiedzi:
-Ta sama opcja ma różne ceny w różnych liniach produktowych (np. pakiet
-antywłamaniowy RC2: +819 dla UniPro, +850 dla PRIME). Tabela opcji ma KILKA
-KOLUMN CENOWYCH — nagłówki to rodziny (UniPro | SNP, SNP 2.0 | RenoSystem SSt |
-RenoSystem SNP). Zawsze:
-  • sprawdź, z której kolumny czytasz, i nazwij tę rodzinę w odpowiedzi;
-  • jeśli pytanie nie wskazuje rodziny, podaj WSZYSTKIE dostępne ceny z
-    etykietami, a nie jedną wybraną;
-  • jeśli w danej kolumnie jest pusto — ta opcja nie jest dostępna dla tej
-    rodziny. Napisz to, nie przenoś ceny z kolumny obok.
-
-TABELE CENOWE (wymiary): wysokość otworu (Ho) w wierszach po lewej, szerokość
-otworu (So) w kolumnach u góry — progi „do” w mm. Brama 2350 × 3050 mm to
-wiersz 2400 i kolumna 3100, nie 2300/3000. Jedna strona może mieć kilka takich
-tabel (brama ręczna, MOTO, METRO, SPARK) — powiedz, z której czytasz. Jeśli
-pytanie nie wskazuje napędu, podaj wszystkie warianty. Zapis „2500x2100”
-traktuj jako szerokość × wysokość, ale napisz, jak go zinterpretowałeś.
-Odcienie szarości w komórkach oznaczają zakresy wykonania lub ograniczenia
-kolorystyczne — sprawdź legendę pod tabelą, zanim zacytujesz taką komórkę.
-
-CENY: netto, VAT wg przepisów (patrz stopka strony) — wspomnij o tym przy
-każdej cenie. Podaj jednostkę dokładnie jak w dokumencie (za szt., za kpl.,
-za m2, za mb., do ceny bramy).
-
-„POKAŻ …”: pytanie o rysunek lub tabelę, nie o liczbę. Zacznij od tego, co
-przedstawia strona i gdzie to jest (numer rysunku/tabeli, np. „Rys. 7”,
-„Tab. 2”), potem podaj istotne dane. Strona i tak zostanie pokazana obok.
-
-CYTATY — wymagane. Po odpowiedzi dodaj blok w dokładnie tym formacie:
-
----CYTATY---
-{"page": 61, "quote": "Wkładka antywłamaniowa", "supports": "nazwa pozycji"}
-{"page": 61, "quote": "Pakiet antywłamaniowy RC2", "supports": "pozycja 20"}
-
-Zasady cytatów:
-  • "page" — numer strony podany w nagłówku obrazu, dokładnie tak jak podano.
-  • "quote" — tekst przepisany DOSŁOWNIE ze strony (nagłówek sekcji, nazwa
-    pozycji w tabeli, etykieta wiersza). Służy do podświetlenia miejsca w
-    dokumencie, więc musi istnieć na stronie znak w znak. Nie parafrazuj.
-  • Cytuj etykietę wiersza/nagłówek, nie samą liczbę — liczby z odpowiedzi są
-    lokalizowane automatycznie.
-  • Jeden wiersz JSON na cytat, bez dodatkowego tekstu w bloku.
-
-Zacznij od odpowiedzi. Bez wstępów."""
-
-
 # --------------------------------------------------------------------------
 # index metadata
 # --------------------------------------------------------------------------
-
-@lru_cache(maxsize=None)
-def articles() -> list[dict]:
-    # Without the article list there is no corpus, so this is one of the few
-    # places that fails instead of degrading. It still names the file and the
-    # command that rebuilds it: the alternative is a JSONDecodeError surfacing
-    # several frames up inside a request handler, which says neither.
-    if not LAYOUT.articles_json.exists():
-        raise FileNotFoundError(
-            f"{LAYOUT.articles_json} missing — run scripts/build_index.py")
-    try:
-        arts = json.loads(LAYOUT.articles_json.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"{LAYOUT.articles_json} is not valid JSON ({e}) — the index is "
-            f"incomplete; rebuild it with scripts/build_index.py") from e
-    # Index may have been built on Windows (`pdfs\\foo.pdf`); Path on macOS/Linux
-    # treats that as a single filename with a backslash, so the source is "missing".
-    for a in arts:
-        url = a.get("url")
-        if isinstance(url, str):
-            a["url"] = url.replace("\\", "/")
-    return arts
-
-
-def doc_title(article_id: int) -> str:
-    a = articles()
-    return a[article_id]["title"] if article_id < len(a) else "?"
-
-
-def page_path(article_id: int, tile_index: int) -> Path:
-    return LAYOUT.page_image(article_id, tile_index)
-
-
-@lru_cache(maxsize=None)
-def page_size(article_id: int, tile_index: int) -> tuple[int, int]:
-    from PIL import Image
-
-    with Image.open(page_path(article_id, tile_index)) as im:
-        return im.size
-
+#
+# The accessors themselves live in corpus.py, and are called through it rather
+# than imported by name. That is deliberate: `from corpus import articles`
+# would bind a second reference here, and a test redirecting `corpus.articles`
+# at a fake index would then reach corpus's callers but not this module's —
+# half the system reading a temporary index and half reading the real one.
+# One name, one owner, patched in one place.
 
 def box_pct(article_id: int, tile_index: int, chunk_index: int) -> dict | None:
     """Chunk box as percentages of the page, for overlaying in the UI."""
-    c = chunkmeta.get(article_id, tile_index, chunk_index, LAYOUT)
+    c = chunkmeta.get(article_id, tile_index, chunk_index, corpus.LAYOUT)
     if c is None or not c.has_box:
         return None
-    pw, ph = page_size(article_id, tile_index)
+    pw, ph = corpus.page_size(article_id, tile_index)
     return {
         "left": 100 * c.x / pw, "top": 100 * c.y / ph,
         "width": 100 * c.width / pw, "height": 100 * c.height / ph,
     }
-
-
-_NUM = re.compile(r"\d[\d   .,]{1,12}\d|\d{2,}")
-
-
-def locate_values(article_id: int, page: int, answer: str) -> list[dict]:
-    """Find where the numbers the model quoted actually sit on the page.
-
-    The rendered tiles are pixels, but these PDFs still carry a text layer, so
-    every figure in the answer can be located exactly rather than approximated
-    by the region the model happened to open. Returns boxes as percentages of
-    the page, same convention as box_pct.
-
-    This is a *check on the model*, not a source of truth: a quoted number that
-    cannot be found on the cited page is worth seeing.
-    """
-    src = Path(articles()[article_id].get("url") or "")
-    if not src.exists() or src.suffix.lower() != ".pdf":
-        return []
-
-    # "3 555 zł" / "3.555" / "3555" should all find the cell reading 3555.
-    # Prices and millimetre dimensions are 3-6 digits. Anything longer is a
-    # date or a document code (answers cite "CBG_PL-PLN_10.10.2024"); anything
-    # shorter matches half the table.
-    stem = src.stem
-    wanted: set[str] = set()
-    for m in _NUM.finditer(answer):
-        raw = m.group(0).strip(" .,\u00a0\u202f")
-        if raw in stem:                       # part of the document identifier
-            continue
-        digits = re.sub(r"[\s.,\u00a0\u202f]", "", raw)
-        if not digits.isdigit() or not 3 <= len(digits) <= 6:
-            continue
-        wanted.add(digits)
-        if raw != digits and len(raw) - len(digits) == 1:
-            wanted.add(raw)                   # "3 555" as typeset in the page
-    if not wanted:
-        return []
-
-    import fitz
-
-    out: list[dict] = []
-    with fitz.open(src) as doc:
-        if not 0 <= page - 1 < doc.page_count:
-            return []
-        pg = doc[page - 1]
-        pw, ph = pg.rect.width, pg.rect.height
-        for term in sorted(wanted, key=len, reverse=True)[:12]:
-            try:
-                rects = pg.search_for(term)
-            except Exception:
-                continue
-            for r in rects[:6]:
-                out.append({
-                    "value": term,
-                    "left": 100 * r.x0 / pw, "top": 100 * r.y0 / ph,
-                    "width": 100 * (r.x1 - r.x0) / pw,
-                    "height": 100 * (r.y1 - r.y0) / ph,
-                    "ambiguous": len(rects) > 1,
-                })
-    return _confirm_intersections(out)
-
-
-def _confirm_intersections(pins: list[dict], tol: float = 1.5) -> list[dict]:
-    """Resolve which copy of a repeated figure is the one actually cited.
-
-    In a price matrix the answer names the row and column thresholds as well as
-    the price, so the right cell is the one sitting under a quoted column header
-    and level with a quoted row header. A value that repeats elsewhere in the
-    table will not satisfy both. This turns two dashed guesses into one
-    confirmed cell without asking the model where it looked.
-    """
-    for p in pins:
-        has_col = any(q is not p and abs(q["left"] - p["left"]) < tol
-                      and q["top"] < p["top"] - tol for q in pins)
-        has_row = any(q is not p and abs(q["top"] - p["top"]) < tol
-                      and q["left"] < p["left"] - tol for q in pins)
-        p["confirmed"] = bool(has_col and has_row)
-    # A confirmed cell is no longer an open question, whatever its twin does.
-    for p in pins:
-        if p["confirmed"]:
-            p["ambiguous"] = False
-    return pins
 
 
 def _parse_pages(spec: str | None) -> dict[int, tuple[int, int]]:
@@ -406,204 +184,9 @@ def _parse_pages(spec: str | None) -> dict[int, tuple[int, int]]:
 # tools
 # --------------------------------------------------------------------------
 
-TOOLS = [
-    {
-        "name": "pixelrag_search",
-        "description": (
-            "Search the visual document index by text. Returns ranked tiles with "
-            "their document, page, and `pages` — the article's valid tile:chunk "
-            "ranges (e.g. '0:0-5,1:0-5' means page 0 has chunks 0-5). Call this "
-            "first, then pixelrag_tile to actually read the content."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Short descriptive query, in the document's own vocabulary."},
-                "n_results": {"type": "integer", "description": "How many tiles to return (default 5, max 10)."},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "pixelrag_tile",
-        "description": (
-            "Look at one region of one page and read it. Returns that region as an "
-            "image. `page` is the same 1-based number search results report and you "
-            "cite. Regions run left-to-right then top-to-bottom, so on a two-column "
-            "page region 0 is top-left, 1 is top-right, 2 is middle-left, and so on. "
-            "Call this multiple times in one turn to open several regions at once."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "article_id": {"type": "integer", "description": "From search results."},
-                # Deliberately 1-based to match the `page` field in search results and
-                # in citations. An earlier 0-based `tile_index` invited the model to
-                # pass the page number it had just been shown, and miss by one.
-                "page": {"type": "integer", "description": "1-based page number, as reported by search."},
-                "region": {"type": "integer", "description": "0-based region within that page."},
-            },
-            "required": ["article_id", "page", "region"],
-        },
-    },
-]
-
-
-# ---- query encoding -------------------------------------------------------
-#
-# `pixelrag serve` encodes the query itself, but it is forced to do so on ONE
-# CPU thread: faiss and torch each ship their own libomp, and two OpenMP
-# runtimes in one process are unsafe, so OMP_NUM_THREADS=1 is the price of
-# having faiss there at all. That single thread is nearly all of search latency
-# (server-side encode p95 1673ms), and profiling puts 98% of it in the forward.
-#
-# Nothing requires the encoder to live in the faiss process — /search accepts a
-# precomputed `embedding`. Encoding here instead takes the same work to p95
-# ~450ms on CPU threads and ~24ms on this box's CUDA GPU in fp16, graphed.
-# Set PIXELRAG_LOCAL_ENCODE=0 to fall back to server-side.
-
-LOCAL_ENCODE = os.environ.get("PIXELRAG_LOCAL_ENCODE", "1") != "0"
-EMBED_MODEL = os.environ.get("PIXELRAG_EMBED_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
-# Prefer the sidecar (scripts/encoder.py) so the ~30s model load is paid once
-# at its startup rather than per process, and one copy of the weights serves
-# every client. Falls back to loading in-process if it isn't running.
-ENCODER_URL = os.environ.get("PIXELRAG_ENCODER_URL", "http://127.0.0.1:8001")
-_encoder: dict | None = None
-_sidecar_ok: bool | None = None
-
-
-def _sidecar_available() -> bool:
-    global _sidecar_ok
-    if _sidecar_ok is None:
-        try:
-            r = _HTTP.get(f"{ENCODER_URL}/health", timeout=2)
-            _sidecar_ok = r.ok and r.json().get("status") == "ok"
-        except requests.RequestException as e:
-            _sidecar_ok = False
-            log.info("encoder sidecar not reachable at %s (%s) — loading the "
-                     "model in-process instead; first query pays ~30s",
-                     ENCODER_URL, e)
-    return _sidecar_ok
-
-
-def _get_encoder() -> dict:
-    """Load the query encoder once. ~28s here — weights, then graph capture.
-
-    Never in the faiss process.
-    """
-    global _encoder
-    if _encoder is None:
-        import torch
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-
-        dev, dtype = encoder_device.resolve(torch)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            EMBED_MODEL, dtype=dtype).eval().to(dev)
-        processor = AutoProcessor.from_pretrained(EMBED_MODEL, trust_remote_code=True)
-        encoder_device.use_fast_tokenise(processor, EMBED_MODEL)
-        encoder_device.graph_forward(torch, model, dev)
-        _encoder = {"processor": processor, "model": model, "device": dev,
-                    "torch": torch}
-        # Record a graph per padding width before returning. Whoever asks first
-        # would otherwise pay ~6s for whichever shape their query happens to
-        # have, and this path is already the slow fallback — its costs belong at
-        # load. Assigning _encoder first is what keeps this from recursing, and
-        # calling _forward_pass rather than embed_query keeps it from queueing
-        # onto the thread it is already running on.
-        for width in encoder_device.warm_widths():
-            _forward_pass("warmup", None, width)
-    return _encoder
-
-
-# pixelrag_serve wraps every query in this chat template before tokenising.
-# Passing raw text instead changes the token sequence entirely and moves the
-# embedding — measured as 1/10 identical rankings until this was replicated.
-DEFAULT_INSTRUCTION = "Retrieve images or text relevant to the user's query."
-
-
-@lru_cache(maxsize=256)
-def _embed_cached(text: str, instruction: str | None) -> tuple[float, ...]:
-    """Memoised encode. Tuple so the cache cannot hand out a mutable list.
-
-    The same text gets encoded more than once per question: retrieve.py searches
-    the question and its noun phrase, and the answer cache needs the question's
-    vector before either search runs. At ~140ms a call that adds up, and the
-    encoder is deterministic for a given text.
-    """
-    if _sidecar_available():
-        r = _HTTP.post(f"{ENCODER_URL}/embed",
-                       json={"text": text, "instruction": instruction}, timeout=60)
-        r.raise_for_status()
-        return tuple(r.json()["embedding"])
-    return tuple(_encode_local(text, instruction))
-
-
-def embed_query(text: str, instruction: str | None = None) -> list[float]:
-    """Encode as pixelrag_serve._encode_queries does.
-
-    Same chat template and instruction, same base-model forward, same
-    last-token pooling over last_hidden_state, same L2 normalisation. Any
-    *structural* divergence puts the query in a different space from the indexed
-    documents and silently degrades retrieval. The arithmetic does differ — fp16,
-    padding and the CUDA graph together move an index score by up to 7.9e-04 at
-    cos 0.999994, which check_parity.py exists to keep honest.
-    """
-    return list(_embed_cached(text, instruction))
-
-
-def _encode_local(text: str, instruction: str | None = None) -> list[float]:
-    """embed_query's in-process case, queued onto the thread that owns the model.
-
-    Which thread runs the forward is not a detail here: it is the thread that
-    recorded the CUDA graphs, and only that thread may replay them. See
-    encoder_device.on_model_thread.
-    """
-    return encoder_device.on_model_thread(_forward_pass, text, instruction, 0)
-
-
-def _forward_pass(text: str, instruction: str | None,
-                  pad_width: int) -> list[float]:
-    """The encode itself — same steps, same order as pixelrag_serve does them.
-
-    Runs on the model thread. Every numerical decision it makes comes from
-    encoder_device, so this path and the sidecar's cannot drift apart; pad_width
-    is how _get_encoder records a graph for a length no query it has happens to
-    produce.
-    """
-    enc = _get_encoder()
-    torch, dev = enc["torch"], enc["device"]
-    messages = [
-        {"role": "system",
-         "content": [{"type": "text",
-                      "text": DEFAULT_INSTRUCTION if instruction is None else instruction}]},
-        {"role": "user", "content": [{"type": "text", "text": text}]},
-    ]
-    prompt = enc["processor"].apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
-    inputs = enc["processor"](text=[prompt], return_tensors="pt", padding=True)
-    inputs = {k: v.to(dev) if hasattr(v, "to") else v for k, v in inputs.items()}
-    inputs, forward = encoder_device.prepare_forward(torch, enc["model"],
-                                                     enc["processor"], inputs,
-                                                     pad_width)
-    with torch.no_grad():
-        out = forward(**inputs)
-    h = out.last_hidden_state
-    idx = inputs["attention_mask"].sum(dim=1) - 1
-    pooled = h[torch.arange(h.size(0), device=h.device), idx]
-    pooled = torch.nn.functional.normalize(pooled, p=2, dim=-1)
-    return pooled.cpu().float().numpy()[0].tolist()
-
-
-def warm_encoder() -> None:
-    """Pay the model load at startup rather than on a user's first question."""
-    if LOCAL_ENCODE:
-        try:
-            embed_query("warmup")
-        except Exception:
-            log.warning("query encoder failed to warm up — queries will be "
-                        "encoded server-side, which is ~7x slower "
-                        "(p95 1673ms against 450ms)", exc_info=True)
-
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
 
 def _raw_search(query: str, n_results: int = 5, timeout: int = 120) -> list[dict]:
     """Raw chunk hits from the faiss service. NOT clamped — see below.
@@ -620,9 +203,9 @@ def _raw_search(query: str, n_results: int = 5, timeout: int = 120) -> list[dict
     caller is retrieve.py and more candidates are strictly better.
     """
     n = max(1, n_results)
-    if LOCAL_ENCODE:
+    if queryembed.LOCAL_ENCODE:
         try:
-            q = {"embedding": embed_query(query)}
+            q = {"embedding": queryembed.embed_query(query)}
         except Exception:
             # The server encodes on one OpenMP thread — p95 1673ms against
             # 450ms here. Correct, and slow enough to be worth saying so.
@@ -658,7 +241,7 @@ def _chunk_texts(hits: list[dict]) -> list[str]:
         by_article.setdefault(hit["article_id"], []).append(i)
 
     for aid, idxs in by_article.items():
-        path = _source_pdf(aid)
+        path = corpus.source_pdf(aid)
         if path is None:
             continue
         heads: dict[int, str] = {}
@@ -666,10 +249,10 @@ def _chunk_texts(hits: list[dict]) -> list[str]:
             for i in idxs:
                 hit = hits[i]
                 ti, ci = hit["tile_index"], hit["chunk_index"]
-                chunk = chunkmeta.get(aid, ti, ci, LAYOUT)
+                chunk = chunkmeta.get(aid, ti, ci, corpus.LAYOUT)
                 if chunk is None or not chunk.has_box:
                     continue
-                pw, ph = page_size(aid, ti)
+                pw, ph = corpus.page_size(aid, ti)
                 page = pdf[ti]
                 sx, sy = page.rect.width / pw, page.rect.height / ph
                 text = page.get_text(clip=fitz.Rect(
@@ -695,7 +278,7 @@ def _page_texts(pages: list[dict]) -> list[str]:
         by_article.setdefault(page["article_id"], []).append(i)
 
     for aid, idxs in by_article.items():
-        path = _source_pdf(aid)
+        path = corpus.source_pdf(aid)
         if path is None:
             continue
         with fitz.open(path) as pdf:
@@ -1168,7 +751,7 @@ def _do_search(query: str, n_results: int = 5,
         # 1-based page invites the model to pass one where the other is meant.
         rows.append({
             "article_id": h["article_id"],
-            "document": doc_title(h["article_id"]),
+            "document": corpus.doc_title(h["article_id"]),
             "page": h["tile_index"] + 1,
             "region": h["chunk_index"],
             "score": round(h["score"], 4),
@@ -1189,7 +772,7 @@ def _do_tile(article_id: int, tile_index: int, chunk_index: int) -> tuple[dict, 
     {"ok": True, "label": str, "image": bytes, "mime": str}; each backend
     formats that into its own tool-result shape.
     """
-    chunks = chunkmeta.for_article(article_id, LAYOUT)
+    chunks = chunkmeta.for_article(article_id, corpus.LAYOUT)
     if (tile_index, chunk_index) not in chunks:
         # Report in the same 1-based page numbering the tool accepts, so the
         # correction the model makes is directly usable.
@@ -1209,11 +792,11 @@ def _do_tile(article_id: int, tile_index: int, chunk_index: int) -> tuple[dict, 
                 {"type": "tile_error", "article_id": article_id,
                  "tile_index": tile_index, "chunk_index": chunk_index})
 
-    pw, ph = page_size(article_id, tile_index)
+    pw, ph = corpus.page_size(article_id, tile_index)
     event = {
         "type": "tile",
         "article_id": article_id,
-        "document": doc_title(article_id),
+        "document": corpus.doc_title(article_id),
         "page": tile_index + 1,
         "tile_index": tile_index,
         "chunk_index": chunk_index,
@@ -1225,7 +808,7 @@ def _do_tile(article_id: int, tile_index: int, chunk_index: int) -> tuple[dict, 
     }
     result = {
         "ok": True,
-        "label": f"{doc_title(article_id)} — page {tile_index + 1}, region {chunk_index}",
+        "label": f"{corpus.doc_title(article_id)} — page {tile_index + 1}, region {chunk_index}",
         "image": resp.content,
         "mime": resp.headers["content-type"].split(";")[0],
     }
@@ -1321,10 +904,10 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
       oneshot — PixelRAG retrieve + one VLM read (default)
       agent   — multi-turn tile browse
 
-    retrieval (or auto): visual | hybrid | jev | jev+hybrid — RETRIEVAL_MODES.
-    Resolved once here and carried down, so everything that runs under one
-    answer — the cache key, both ask modes, every tool call in a browse loop —
-    agrees on which mode produced it.
+    retrieval (or auto): any of RETRIEVAL_MODES — visual | hybrid | jev-expand
+    | jev | jev+hybrid | jev-page | xray. Resolved once here and carried down,
+    so everything that runs under one answer — the cache key, both ask modes,
+    every tool call in a browse loop — agrees on which mode produced it.
     """
     mode = (mode or ASK_MODE).strip().lower()
     if mode not in ("oneshot", "agent"):
@@ -1348,7 +931,7 @@ def run_agent(question: str, on_event=None, max_steps: int = MAX_STEPS,
     if mode == "oneshot":
         ns = _cache_namespace(reader.name, reader.model, mode, retrieval)
         try:
-            key = embed_query(question.strip())
+            key = queryembed.embed_query(question.strip())
         except Exception:
             # Encoder down: answer the slow way rather than fail, but the
             # answer cache is off for this question and nothing else says so.
@@ -1405,7 +988,7 @@ def _read_once(reader, question: str, emit, trace: list[dict],
                                   retrieval=retrieval)
     marks["retrieval"] = time.perf_counter()
     if not pages:
-        return _done(NO_PAGES_PL, trace, providers.Usage(), 1, reader,
+        return _done(prompts.NO_PAGES_PL, trace, providers.Usage(), 1, reader,
                      retrieval, _timings(started, marks))
 
     # The gate judges the pages being attached, not the candidate pool the
@@ -1419,7 +1002,7 @@ def _read_once(reader, question: str, emit, trace: list[dict],
                  verdict, gate.answerable, gate.scope, JEV_REFUSE)
         emit({"type": "refused", "answerable": gate.answerable,
               "scope": gate.scope, "verdict": verdict, "threshold": JEV_REFUSE})
-        result = _done(REFUSAL_PL[verdict], trace, providers.Usage(), 1, reader,
+        result = _done(prompts.REFUSAL_PL[verdict], trace, providers.Usage(), 1, reader,
                        retrieval, _timings(started, marks))
         result["answerable"] = gate.answerable
         result["scope"] = gate.scope
@@ -1433,10 +1016,10 @@ def _read_once(reader, question: str, emit, trace: list[dict],
         _stream_answer(emit, piece)
 
     reply = reader.read_pages(
-        system=ONESHOT_SYSTEM,
-        preamble=_oneshot_preamble(question, pages),
+        system=prompts.ONESHOT_SYSTEM,
+        preamble=prompts.oneshot_preamble(question, pages),
         pages=pages,
-        header_of=_page_header,
+        header_of=prompts.page_header,
         on_text=on_text,
     )
     result = _done(reply.text, trace, reply.usage, reply.steps, reader,
@@ -1450,7 +1033,7 @@ def _browse(reader, question: str, emit, trace: list[dict],
             max_steps: int, retrieval: str, started: float) -> dict:
     """Agent mode: the reader drives, opening regions until it can answer."""
     reply = reader.browse(
-        system=SYSTEM, question=question, tools=TOOLS,
+        system=prompts.SYSTEM, question=question, tools=prompts.TOOLS,
         dispatch=_dispatcher(retrieval), on_event=emit, max_steps=max_steps)
     # No retrieval or first-token mark: retrieval happens inside the loop, once
     # per tool call, and each of those search events carries its own stats.
@@ -1513,7 +1096,7 @@ def _lexical_fn(required: bool = False):
 
 def _scale_of(article_id: int, tile_index: int, chunk_index: int) -> str:
     """retrieve.py's ScaleFn, bound to this process's index."""
-    return chunkmeta.scale_of(article_id, tile_index, chunk_index, LAYOUT)
+    return chunkmeta.scale_of(article_id, tile_index, chunk_index, corpus.LAYOUT)
 
 
 def _hit_row(p: pagehit.PageHit) -> dict:
@@ -1532,7 +1115,7 @@ def _hit_row(p: pagehit.PageHit) -> dict:
     """
     return {
         "article_id": p.article_id,
-        "document": doc_title(p.article_id),
+        "document": corpus.doc_title(p.article_id),
         "page": p.page,
         "score": round(p.ranking_score, 5),
         "raw_score": round(p.score, 4),
@@ -1565,10 +1148,10 @@ def _oneshot_pages(question: str, emit, policy: imagefit.Policy,
 
     pages: list[dict] = []
     for p in pages_ranked:
-        path = page_path(p.article_id, p.tile_index)
+        path = corpus.page_path(p.article_id, p.tile_index)
         if not path.exists():
             continue
-        pw, ph = page_size(p.article_id, p.tile_index)
+        pw, ph = corpus.page_size(p.article_id, p.tile_index)
         # Highlight the strongest *region* chunk. The gist chunk covers the whole
         # page, so boxing it would mark everything and mean nothing.
         box = (box_pct(p.article_id, p.tile_index, p.focus)
@@ -1596,168 +1179,13 @@ def _oneshot_pages(question: str, emit, policy: imagefit.Policy,
         emit({"type": "tile", **event})
         # What the reader gets, which is the event plus the pixels themselves.
         pages.append({**event, "image": img, "mime": mime,
-                      "label": f"{doc_title(p.article_id)} — strona {p.page}"})
+                      "label": f"{corpus.doc_title(p.article_id)} — strona {p.page}"})
     return pages, stats
 
 
 # --------------------------------------------------------------------------
 # citations
 # --------------------------------------------------------------------------
-
-CITE_MARK = "---CYTATY---"
-
-
-def _source_pdf(article_id: int) -> Path | None:
-    src = Path(articles()[article_id].get("url") or "")
-    return src if src.exists() and src.suffix.lower() == ".pdf" else None
-
-
-def split_citations(text: str) -> tuple[str, list[dict]]:
-    """Separate the prose answer from the trailing ---CYTATY--- JSONL block.
-
-    Tolerant by design: a reader that omits the block, fences it in ```, or
-    writes one malformed line should still produce a usable answer. Anything
-    unparseable is dropped rather than shown.
-    """
-    if CITE_MARK not in text:
-        return text.strip(), []
-    body, _, tail = text.partition(CITE_MARK)
-    cites = []
-    for line in tail.splitlines():
-        line = line.strip().strip("`")
-        if not line.startswith("{"):
-            continue
-        try:
-            c = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(c, dict) and c.get("quote"):
-            cites.append(c)
-    return body.strip(), cites
-
-
-def resolve_citations(answer: str, cites: list[dict],
-                      pages: list[dict]) -> list[dict]:
-    """Attach highlight rectangles to each citation, over the ORIGINAL page.
-
-    Two independent sources of geometry, because they fail in different places:
-      * the quoted phrase, located in the PDF text layer — precise, and the thing
-        the reader actually claims to have read;
-      * every figure in the answer prose, located on the same page — this is what
-        someone checking a quoted price wants boxed, and the reader rarely quotes
-        the number and its row label in one span.
-    A citation whose quote cannot be found on the page it names is kept and
-    flagged: that is the clearest available signal that the reader drifted.
-    """
-    import citations as C
-
-    # Keyed on (article_id, page), NOT page alone: both catalogues have a page
-    # 61, so a bare page number resolved a citation against whichever document
-    # happened to be last in the list — then located the quote in that
-    # document's PDF and drew the highlight there. The reader names only a page
-    # number, so the article is recovered by looking for that page among the
-    # ones actually attached, preferring the highest-ranked.
-    by_key = {(p["article_id"], p["page"]): p for p in pages}
-    first_by_page: dict[int, dict] = {}
-    for p in pages:
-        first_by_page.setdefault(p["page"], p)
-
-    out = []
-    for c in cites:
-        try:
-            pno = int(c.get("page"))
-        except (TypeError, ValueError):
-            continue
-        aid = c.get("article_id")
-        target = (by_key.get((aid, pno)) if aid is not None
-                  else first_by_page.get(pno))
-        if target is None:
-            continue
-        pdf = _source_pdf(target["article_id"])
-        quote = str(c["quote"])
-        found = C.locate_quote(pdf, pno, quote) if pdf else []
-        out.append({
-            "document": target["document"],
-            "article_id": target["article_id"],
-            "page": pno,
-            "quote": quote,
-            "supports": c.get("supports") or "",
-            "rects": found[0]["rects"] if found else [],
-            "coverage": found[0]["coverage"] if found else 0.0,
-            # No text layer at all → the region box from PixelRAG is the only
-            # geometry available, and the UI falls back to it.
-            "text_layer": bool(pdf and C._page_words(str(pdf), pno)),
-            "verified": bool(found),
-        })
-
-    # Numbers are per (document, page), not per citation — attach to the first
-    # citation of each so the UI draws each box once. Grouping by page alone
-    # would pin one document's figures onto another's page of the same number.
-    for aid, pno in {(c["article_id"], c["page"]) for c in out}:
-        pdf = _source_pdf(aid)
-        if not pdf:
-            continue
-        pinned, repeated = C.locate_numbers(pdf, pno, answer)
-        for c in out:
-            if c["article_id"] == aid and c["page"] == pno:
-                c["numbers"] = pinned
-                c["repeated"] = repeated
-                break
-    return out
-
-
-NO_PAGES_PL = (
-    "Nie znalazłem w zaindeksowanych dokumentach żadnej strony pasującej do tego "
-    "pytania, więc nie mogę na nie odpowiedzieć. Sprawdź, czy dokument na ten "
-    "temat jest w katalogu pdfs/ i czy indeks został przebudowany."
-)
-
-# One refusal used to cover two different failures, and the sentence it showed
-# was wrong for one of them. `jev.Gate` separates them; these are what each one
-# should actually say, because "rebuild your index" is unhelpful advice to
-# someone who asked a door catalogue about engine oil.
-REFUSAL_PL = {
-    "not-in-corpus": (
-        "Te dokumenty dotyczą tego tematu, ale nie zawierają informacji "
-        "potrzebnej do odpowiedzi na to pytanie — nie odpowiadam, zamiast "
-        "zgadywać. Prawdopodobnie potrzebny jest inny dokument (np. cennik "
-        "zamiast karty technicznej)."),
-    "out-of-scope": (
-        "To pytanie dotyczy innej dziedziny niż zaindeksowane dokumenty, "
-        "więc nie ma tu na nie odpowiedzi."),
-}
-
-
-def _page_header(p: dict) -> str:
-    """Label above each attached image.
-
-    The page number here is what the reader must echo back in its citation
-    block, so it is stated once, unambiguously, in the same form we parse.
-    """
-    return f"\n[{p['document']} — strona {p['page']}]  (page={p['page']})"
-
-
-def _oneshot_preamble(question: str, pages: list[dict]) -> str:
-    """User-turn framing: the question, the page inventory, and the ask.
-
-    Listing which pages are attached (and how many regions of each matched)
-    matters for the family-disambiguation rule: a reader that can see it was
-    given three pages from one catalogue knows to check whether they are
-    different product lines rather than assuming one answer.
-    """
-    inventory = "\n".join(
-        f"  • strona {p['page']} — {p['document']}"
-        f" (dopasowane regiony: {p.get('n_chunks', 1)})"
-        for p in pages
-    )
-    return (
-        f"Pytanie: {question}\n\n"
-        f"Poniżej {len(pages)} zrzut(y) stron znalezionych przez wyszukiwanie "
-        f"wizualne:\n{inventory}\n\n"
-        "Przeczytaj je i odpowiedz. Jeśli odpowiedzi tam nie ma — napisz to. "
-        "Pamiętaj o bloku ---CYTATY--- na końcu."
-    )
-
 
 def _stream_answer(emit, text: str) -> None:
     """Push a fragment of the answer to the caller as it arrives.
@@ -1785,12 +1213,12 @@ def _done(answer: str, trace: list[dict], usage: providers.Usage, steps: int,
     provider, model = reader.name, reader.model
 
     # The reader's own citations, geometry resolved against the source PDF.
-    body, raw_cites = split_citations(answer or "")
+    body, raw_cites = citeparse.split_citations(answer or "")
     pages_seen = [{"article_id": e["article_id"], "page": e["page"],
                    "document": e["document"]}
                   for e in trace if e["type"] == "tile"]
     try:
-        cites = resolve_citations(body, raw_cites, pages_seen)
+        cites = citeparse.resolve_citations(body, raw_cites, pages_seen)
     except Exception:
         # Highlighting is a nicety; never fail the answer over it. It is still
         # the reader's own evidence, so losing it is worth a line.
@@ -1804,7 +1232,7 @@ def _done(answer: str, trace: list[dict], usage: providers.Usage, steps: int,
         for aid, page in sorted({(e["article_id"], e["page"])
                                  for e in trace if e["type"] == "tile"}):
             try:
-                for hit in locate_values(aid, page, body):
+                for hit in citeparse.locate_values(aid, page, body):
                     pins.append({"article_id": aid, "page": page, **hit})
             except Exception:
                 log.debug("number pinning failed for article %s page %s",

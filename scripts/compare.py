@@ -28,6 +28,7 @@ import logging
 import sys
 import time
 
+import corpus
 import rag
 
 log = logging.getLogger("pixelrag")
@@ -142,7 +143,7 @@ def _print(rows: list[dict]) -> None:
             print(f"{'':<12}  ! {note}")
     print()
     for row in agreement(rows):
-        title = rag.doc_title(row["article_id"])
+        title = corpus.doc_title(row["article_id"])
         print(f"  s.{row['page']:<4} {title[:40]:<42} {', '.join(row['modes'])}")
 
 

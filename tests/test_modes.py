@@ -16,6 +16,7 @@ import pytest
 
 import compare
 import jev
+import corpus
 import rag
 
 
@@ -31,7 +32,7 @@ def wired(monkeypatch):
     monkeypatch.delenv("PIXELRAG_JEV", raising=False)
     monkeypatch.setattr(rag, "HYBRID", False)
     monkeypatch.setattr(rag, "_scale_of", lambda a, t, c: "region")
-    monkeypatch.setattr(rag, "doc_title", lambda aid: f"doc{aid}")
+    monkeypatch.setattr(corpus, "doc_title", lambda aid: f"doc{aid}")
     seen = []
 
     def raw(query, n, timeout=120):

@@ -29,6 +29,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import compare as compare_modes
+import corpus
+import queryembed
 import rag
 import snip
 
@@ -110,16 +112,16 @@ def _sse(payload: dict) -> str:
 @app.get("/api/docs")
 def list_docs():
     out = []
-    for i, a in enumerate(rag.articles()):
+    for i, a in enumerate(corpus.articles()):
         out.append({"article_id": i, "title": a["title"],
-                    "pages": len(rag.LAYOUT.page_images(i))})
+                    "pages": len(corpus.LAYOUT.page_images(i))})
     return {"docs": out}
 
 
 @app.get("/api/page/{article_id}/{page}")
 def page_image(article_id: int, page: int):
     """Full page image; `page` is 1-based, matching what the UI shows."""
-    p = rag.page_path(article_id, page - 1)
+    p = corpus.page_path(article_id, page - 1)
     if not p.exists():
         return JSONResponse({"error": "no such page"}, status_code=404)
     return FileResponse(p, media_type="image/jpeg")
@@ -141,7 +143,7 @@ def citation_snip(
     use. What the crop actually shows — padding, minimum size, the fallback band
     for an unverified citation — is snip.py's business, not this route's.
     """
-    src = rag.page_path(article_id, page - 1)
+    src = corpus.page_path(article_id, page - 1)
     if not src.exists():
         return JSONResponse({"error": "no such page"}, status_code=404)
 
@@ -171,7 +173,7 @@ def source_pdf(article_id: int):
     `inline`, not `attachment`: the same URL backs the "otwórz PDF ↗" link, and
     a download prompt there is not what the user asked for.
     """
-    arts = rag.articles()
+    arts = corpus.articles()
     if not 0 <= article_id < len(arts):
         return JSONResponse({"error": "no such document"}, status_code=404)
     src = Path(arts[article_id].get("url") or "")
@@ -251,8 +253,9 @@ if __name__ == "__main__":
     rag.configure_logging()
     if not rag.INDEX_DIR.exists():
         sys.exit(f"No index at {rag.INDEX_DIR} — build it first (see README).")
-    # The query encoder lives here rather than in the faiss process (see rag.py).
-    # Load it now, in the background, so the first question doesn't pay for it.
-    if rag.LOCAL_ENCODE:
-        threading.Thread(target=rag.warm_encoder, daemon=True).start()
+    # The query encoder lives here rather than in the faiss process (see
+    # queryembed.py). Load it now, in the background, so the first question
+    # doesn't pay for it.
+    if queryembed.LOCAL_ENCODE:
+        threading.Thread(target=queryembed.warm_encoder, daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

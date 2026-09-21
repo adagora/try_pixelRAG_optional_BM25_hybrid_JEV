@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 
+import queryembed
 import rag
 import requests
 import yaml
@@ -89,13 +90,13 @@ def main():
             sys.exit(f"No search API on {rag.SEARCH_API} ({e}). "
                      f"Start pixelrag serve, or pass --encode-only.")
 
-    mode = ("sidecar" if rag._sidecar_available() else "in-process") if rag.LOCAL_ENCODE \
+    mode = ("sidecar" if queryembed._sidecar_available() else "in-process") if queryembed.LOCAL_ENCODE \
         else "server-side"
     print(f"encode: {mode}   queries: {args.n}   warmup: {args.warmup}\n", flush=True)
 
     for q in queries[:args.warmup]:
         if args.encode_only:
-            rag.embed_query(q)
+            queryembed.embed_query(q)
         else:
             rag.search(q, n_results=args.k)
 
@@ -104,7 +105,7 @@ def main():
         t0 = time.perf_counter()
         # In server-side mode there is no local encode to time; the whole cost
         # lands in the POST, which is exactly the point of that comparison.
-        emb = rag.embed_query(q) if rag.LOCAL_ENCODE else None
+        emb = queryembed.embed_query(q) if queryembed.LOCAL_ENCODE else None
         t1 = time.perf_counter()
         if not args.encode_only:
             payload = {"embedding": emb} if emb is not None else {"text": q}

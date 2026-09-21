@@ -72,6 +72,7 @@ import os
 import time
 from pathlib import Path
 
+import corpus
 import imagefit
 import layout
 import providers
@@ -145,7 +146,7 @@ def load(article_id: int, tile_index: int) -> str | None:
 
 def _pages() -> list[tuple[int, int, Path]]:
     out = []
-    for d in rag.LAYOUT.tile_dirs():
+    for d in corpus.LAYOUT.tile_dirs():
         aid = layout._article_id_of(d)
         if aid < 0:
             continue
@@ -245,7 +246,7 @@ def measure() -> None:
     tot_i = tot_t = 0
     for key in done:
         aid, tile = (int(x) for x in key.split("/"))
-        path = rag.page_path(aid, tile)
+        path = corpus.page_path(aid, tile)
         text = load(aid, tile) or ""
 
         img, mime = imagefit.fit(path, providers.GeminiReader().image_policy)

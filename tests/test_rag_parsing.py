@@ -10,13 +10,15 @@ from __future__ import annotations
 import pytest
 
 import providers
+import citeparse
+import corpus
 import rag
 
 
 # -- the ---CYTATY--- block -------------------------------------------------
 
 def test_split_citations_separates_prose_from_the_block():
-    body, cites = rag.split_citations(
+    body, cites = citeparse.split_citations(
         'Cena to 3956 zł netto.\n'
         '---CYTATY---\n'
         '{"page": 61, "quote": "Wkladka antywlamaniowa", "supports": "pozycja 20"}\n')
@@ -26,18 +28,18 @@ def test_split_citations_separates_prose_from_the_block():
 
 
 def test_split_citations_without_a_block():
-    assert rag.split_citations("Nie znalazłem.") == ("Nie znalazłem.", [])
+    assert citeparse.split_citations("Nie znalazłem.") == ("Nie znalazłem.", [])
 
 
 def test_split_citations_tolerates_code_fences():
     """A reader that fences the block must still produce a usable answer."""
-    _, cites = rag.split_citations(
+    _, cites = citeparse.split_citations(
         'A.\n---CYTATY---\n```\n{"page": 1, "quote": "x"}\n```\n')
     assert len(cites) == 1
 
 
 def test_split_citations_drops_malformed_lines_and_keeps_the_rest():
-    _, cites = rag.split_citations(
+    _, cites = citeparse.split_citations(
         'A.\n---CYTATY---\n'
         '{"page": 1, "quote": "dobry"}\n'
         '{"page": 2, "quote": nieprawidlowy}\n'
@@ -47,14 +49,14 @@ def test_split_citations_drops_malformed_lines_and_keeps_the_rest():
 
 
 def test_split_citations_requires_a_quote():
-    _, cites = rag.split_citations('A.\n---CYTATY---\n{"page": 1}\n')
+    _, cites = citeparse.split_citations('A.\n---CYTATY---\n{"page": 1}\n')
     assert cites == []
 
 
 def test_split_citations_strips_the_block_from_the_answer():
     """The marker exists so raw citation JSON never reaches the user."""
-    body, _ = rag.split_citations('Odpowiedź.\n---CYTATY---\n{"page":1,"quote":"q"}')
-    assert rag.CITE_MARK not in body
+    body, _ = citeparse.split_citations('Odpowiedź.\n---CYTATY---\n{"page":1,"quote":"q"}')
+    assert citeparse.CITE_MARK not in body
 
 
 # -- page spec conversion ---------------------------------------------------
@@ -161,7 +163,7 @@ def test_done_never_fails_the_answer_over_highlighting(monkeypatch, fake_reader)
     def boom(*a, **k):
         raise RuntimeError("no text layer")
 
-    monkeypatch.setattr(rag, "resolve_citations", boom)
+    monkeypatch.setattr(citeparse, "resolve_citations", boom)
     r = rag._done('Odp.\n---CYTATY---\n{"page":1,"quote":"q"}',
                   [{"type": "tile", "article_id": 0, "page": 1, "document": "d"}],
                   providers.Usage(), 1, fake_reader(), "visual", {})
@@ -178,8 +180,8 @@ def _pages():
 
 
 def test_resolve_citations_uses_the_article_id_when_the_reader_gives_one(monkeypatch):
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: None)
-    out = rag.resolve_citations(
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: None)
+    out = citeparse.resolve_citations(
         "", [{"page": 61, "quote": "q", "article_id": 0}], _pages())
     assert out[0]["document"] == "BR-77"
 
@@ -187,27 +189,27 @@ def test_resolve_citations_uses_the_article_id_when_the_reader_gives_one(monkeyp
 def test_resolve_citations_falls_back_to_the_highest_ranked_page(monkeypatch):
     """The reader names only a page number, so the article is recovered from the
     pages actually attached, preferring the one retrieval ranked first."""
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: None)
-    out = rag.resolve_citations("", [{"page": 61, "quote": "q"}], _pages())
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: None)
+    out = citeparse.resolve_citations("", [{"page": 61, "quote": "q"}], _pages())
     assert out[0]["article_id"] == 1
 
 
 def test_resolve_citations_drops_a_page_that_was_never_attached(monkeypatch):
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: None)
-    assert rag.resolve_citations("", [{"page": 999, "quote": "q"}], _pages()) == []
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: None)
+    assert citeparse.resolve_citations("", [{"page": 999, "quote": "q"}], _pages()) == []
 
 
 def test_resolve_citations_drops_a_non_numeric_page(monkeypatch):
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: None)
-    assert rag.resolve_citations("", [{"page": "sześćdziesiąt", "quote": "q"}],
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: None)
+    assert citeparse.resolve_citations("", [{"page": "sześćdziesiąt", "quote": "q"}],
                                  _pages()) == []
 
 
 def test_resolve_citations_flags_an_unverified_quote(monkeypatch):
     """A quote that cannot be found on the page it names is kept and flagged —
     the clearest available signal that the reader drifted."""
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: None)
-    out = rag.resolve_citations("", [{"page": 61, "quote": "q"}], _pages())
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: None)
+    out = citeparse.resolve_citations("", [{"page": 61, "quote": "q"}], _pages())
     assert out[0]["verified"] is False and out[0]["rects"] == []
 
 

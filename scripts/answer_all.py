@@ -27,6 +27,7 @@ import sys
 import time
 from pathlib import Path
 
+import corpus
 import rag
 import yaml
 
@@ -47,7 +48,7 @@ def main() -> None:
     args = ap.parse_args()
 
     qs = yaml.safe_load(EVAL.read_text(encoding="utf-8"))
-    t2i = {a["title"]: i for i, a in enumerate(rag.articles())}
+    t2i = {a["title"]: i for i, a in enumerate(corpus.articles())}
     aid = t2i.get(CORPUS_DOC)
     if aid is None:
         sys.exit(f"{CORPUS_DOC} not in the index — rebuild first.")

@@ -19,6 +19,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import corpus
 import rag
 import retrieve
 import yaml
@@ -39,7 +40,7 @@ CORPUS_DOC = "Cennik - Bramy garażowe"
 
 
 def _title_to_id() -> dict[str, int]:
-    return {a["title"]: i for i, a in enumerate(rag.articles())}
+    return {a["title"]: i for i, a in enumerate(corpus.articles())}
 
 
 def _gold(q: dict, t2i: dict[str, int]) -> tuple[set[tuple[int, int]], tuple | None]:

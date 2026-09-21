@@ -13,6 +13,9 @@ import pytest
 import answer_cache
 import imagefit
 import providers
+import prompts
+import queryembed
+import corpus
 import rag
 
 
@@ -24,7 +27,7 @@ def wired(monkeypatch, index, fake_reader, tmp_path):
     """
     import chunkmeta
 
-    monkeypatch.setattr(rag, "LAYOUT", index)
+    monkeypatch.setattr(corpus, "LAYOUT", index)
     # The project's own .env sets PIXELRAG_HYBRID=1, which rag.py reads at
     # import — so without this a gate test that also sets TYPESAFE_API_KEY
     # resolves to `jev+hybrid` and BM25 answers from the REAL text sidecar,
@@ -34,9 +37,9 @@ def wired(monkeypatch, index, fake_reader, tmp_path):
     monkeypatch.setattr(rag, "HYBRID", False)
     monkeypatch.setattr(rag, "_scale_of",
                         lambda a, t, c: chunkmeta.scale_of(a, t, c, index))
-    monkeypatch.setattr(rag, "doc_title", lambda aid: f"doc{aid}")
-    monkeypatch.setattr(rag, "page_size", lambda a, t: (1654, 2339))
-    monkeypatch.setattr(rag, "articles", lambda: [{"title": "doc0", "url": ""}])
+    monkeypatch.setattr(corpus, "doc_title", lambda aid: f"doc{aid}")
+    monkeypatch.setattr(corpus, "page_size", lambda a, t: (1654, 2339))
+    monkeypatch.setattr(corpus, "articles", lambda: [{"title": "doc0", "url": ""}])
     # A page image on disk for every tile the fake search returns.
     from PIL import Image
 
@@ -56,7 +59,7 @@ def wired(monkeypatch, index, fake_reader, tmp_path):
     monkeypatch.setattr(
         answer_cache, "_default",
         answer_cache.AnswerCache(tmp_path / "v.npz", tmp_path / "m.json"))
-    monkeypatch.setattr(rag, "embed_query", lambda q, instruction=None: [1.0, 0.0])
+    monkeypatch.setattr(queryembed, "embed_query", lambda q, instruction=None: [1.0, 0.0])
 
     def install(**kwargs):
         reader = fake_reader(**kwargs)
@@ -87,7 +90,7 @@ def test_the_reader_is_given_the_retrieved_pages(wired):
 def test_the_reader_is_given_the_one_shot_system_prompt(wired):
     reader = wired()
     rag.run_agent("q")
-    assert reader.system == rag.ONESHOT_SYSTEM
+    assert reader.system == prompts.ONESHOT_SYSTEM
 
 
 def test_each_page_is_labelled_with_the_number_the_reader_must_cite(wired):
@@ -160,7 +163,7 @@ def test_no_pages_gives_the_documented_non_answer(wired, monkeypatch):
     reader = wired()
     monkeypatch.setattr(rag, "_raw_search", lambda q, n, timeout=120: [])
     result = rag.run_agent("q")
-    assert result["answer"] == rag.NO_PAGES_PL
+    assert result["answer"] == prompts.NO_PAGES_PL
     assert reader.calls == 0                     # and never pay for the read
 
 
@@ -196,7 +199,7 @@ def test_the_gate_judges_the_attached_pages_and_can_refuse(wired, monkeypatch):
     result = rag.run_agent("Ile kosztuje samochód?")
     # In scope (0.91) but not in these pages (0.02): the corpus is the right
     # one and the answer is not in it, which is its own sentence.
-    assert result["answer"] == rag.REFUSAL_PL["not-in-corpus"]
+    assert result["answer"] == prompts.REFUSAL_PL["not-in-corpus"]
     assert result["answerable"] == 0.02 and result["scope"] == 0.91  # ubs:ignore — stub literals, nothing computes on them
     assert result["refused"] == "not-in-corpus"
     assert reader.calls == 0                 # never paid for the read
@@ -222,8 +225,8 @@ def test_out_of_scope_refuses_on_scope_alone_and_says_something_else(wired, monk
 
     result = rag.run_agent("Jak wymienić olej w silniku?")
     assert result["refused"] == "out-of-scope"
-    assert result["answer"] == rag.REFUSAL_PL["out-of-scope"]
-    assert result["answer"] != rag.REFUSAL_PL["not-in-corpus"]
+    assert result["answer"] == prompts.REFUSAL_PL["out-of-scope"]
+    assert result["answer"] != prompts.REFUSAL_PL["not-in-corpus"]
     assert reader.calls == 0
 
 
@@ -359,7 +362,7 @@ def test_a_dead_encoder_answers_the_slow_way_rather_than_failing(wired, monkeypa
         raise ConnectionError("encoder sidecar is gone")
 
     reader = wired(answer="Nadal działa")
-    monkeypatch.setattr(rag, "embed_query", down)
+    monkeypatch.setattr(queryembed, "embed_query", down)
     assert rag.run_agent("q")["answer"] == "Nadal działa"
     assert reader.calls == 1
 
@@ -434,7 +437,7 @@ def test_agent_mode_uses_the_browse_prompt(wired):
     reader = wired(answer="Znalazłem.", steps=3)
     result = rag.run_agent("q", mode="agent")
     assert result["answer"] == "Znalazłem." and result["steps"] == 3
-    assert reader.system == rag.SYSTEM
+    assert reader.system == prompts.SYSTEM
 
 
 def test_agent_mode_is_never_cached(wired):

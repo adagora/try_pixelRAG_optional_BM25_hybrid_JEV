@@ -1,6 +1,7 @@
 import pytest
 import requests
 
+import corpus
 import jev
 
 
@@ -72,7 +73,10 @@ def test_http_contract(monkeypatch):
                     "usage": {"input_tokens": 312, "output_tokens": 48}}
     def post(url, **kwargs):
         assert url == jev.ENDPOINT
-        assert kwargs["headers"]["Authorization"] == "Bearer test-key"
+        # Asserts the header is BUILT right, against a fake literal. Nothing is
+        # authenticated here, so there is no timing surface to defend.
+        auth = kwargs["headers"]["Authorization"]
+        assert auth == "Bearer test-key"  # ubs:ignore — fake literal, not a secret
         assert kwargs["json"]["model"] == "jev-latest"
         assert kwargs["timeout"] == 20
         return Response()
@@ -90,8 +94,8 @@ def test_chunk_text_uses_crop_geometry(monkeypatch, tmp_path):
         page.insert_text((20, 30), "inside")
         page.insert_text((20, 150), "outside")
         pdf.save(path)
-    monkeypatch.setattr(rag, "_source_pdf", lambda aid: path)
-    monkeypatch.setattr(rag, "page_size", lambda aid, ti: (400, 400))
+    monkeypatch.setattr(corpus, "source_pdf", lambda aid: path)
+    monkeypatch.setattr(corpus, "page_size", lambda aid, ti: (400, 400))
     monkeypatch.setattr(chunkmeta, "get", lambda *args:
                         chunkmeta.Chunk(0, 1, "region", 0, 0, 400, 200))
     text = rag._chunk_text(hit(0))

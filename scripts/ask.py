@@ -18,6 +18,8 @@ Usage:
 import argparse
 import sys
 
+import citeparse
+import corpus
 import rag
 import requests
 
@@ -63,7 +65,7 @@ def main():
         except requests.RequestException as e:
             sys.exit(f"Search API unreachable on {rag.SEARCH_API}: {e}")
         for h in hits:
-            print(f"  {rag.doc_title(h['article_id'])} "
+            print(f"  {corpus.doc_title(h['article_id'])} "
                   f"p{h['tile_index'] + 1} region {h['chunk_index']}  "
                   f"score {h['score']:.3f}")
         return
@@ -98,14 +100,14 @@ def main():
             if nonlocal_state["done"]:
                 return
             buf = nonlocal_state["buf"]
-            if rag.CITE_MARK in buf:
+            if citeparse.CITE_MARK in buf:
                 nonlocal_state["done"] = True
-                tail = buf.split(rag.CITE_MARK)[0]
+                tail = buf.split(citeparse.CITE_MARK)[0]
                 text = tail[nonlocal_state["shown"]:]
             else:
                 # Hold back a marker's worth so a split delta cannot print a
                 # partial "---CYTATY---" before we recognise it.
-                keep = max(0, len(buf) - len(rag.CITE_MARK))
+                keep = max(0, len(buf) - len(citeparse.CITE_MARK))
                 text = buf[nonlocal_state["shown"]:keep]
             if text:
                 if not streamed:

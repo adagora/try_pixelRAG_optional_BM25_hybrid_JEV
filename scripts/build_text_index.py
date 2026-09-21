@@ -24,6 +24,7 @@ import json
 import sys
 
 import lexical
+import corpus
 import rag
 
 
@@ -31,7 +32,7 @@ def main() -> None:
     if not rag.INDEX_DIR.exists():
         sys.exit("No ./index — build the visual index first (see README).")
 
-    arts = rag.articles()
+    arts = corpus.articles()
     data = lexical.build_sidecar(arts)
     pgs = data["pages"]
     vis_only = [p for p in pgs if p["visual_only"]]
@@ -52,7 +53,7 @@ def main() -> None:
     # before they are ever embedded — so the old search-time blank mask is dead.
     # Reported here only as a check that the chunker did its job.
     total = blanks = 0
-    for d in rag.LAYOUT.tile_dirs():
+    for d in corpus.LAYOUT.tile_dirs():
         m = d / "chunks.json"
         if not m.exists():
             continue

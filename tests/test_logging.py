@@ -13,6 +13,7 @@ import pytest
 
 import answer_cache
 import imagefit
+import queryembed
 import rag
 
 
@@ -25,18 +26,18 @@ def test_a_dead_encoder_sidecar_is_reported(monkeypatch, caplog):
     """Losing the sidecar costs ~30s on the next query and nothing said so."""
     import requests
 
-    monkeypatch.setattr(rag, "_sidecar_ok", None)
-    monkeypatch.setattr(rag._HTTP, "get",
+    monkeypatch.setattr(queryembed, "_sidecar_ok", None)
+    monkeypatch.setattr(queryembed._HTTP, "get",
                         lambda *a, **k: (_ for _ in ()).throw(
                             requests.RequestException("refused")))
-    assert rag._sidecar_available() is False
+    assert queryembed._sidecar_available() is False
     assert "encoder sidecar not reachable" in caplog.text
 
 
 def test_falling_back_to_server_side_encoding_is_reported(monkeypatch, caplog):
     """The 7x latency regression that looks like a fast path from outside."""
-    monkeypatch.setattr(rag, "LOCAL_ENCODE", True)
-    monkeypatch.setattr(rag, "embed_query",
+    monkeypatch.setattr(queryembed, "LOCAL_ENCODE", True)
+    monkeypatch.setattr(queryembed, "embed_query",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cuda")))
     monkeypatch.setattr(rag._HTTP, "post", _fake_search_response)
     rag.search("q")
@@ -44,7 +45,7 @@ def test_falling_back_to_server_side_encoding_is_reported(monkeypatch, caplog):
 
 
 def test_a_disabled_answer_cache_is_reported(monkeypatch, caplog, tmp_path):
-    monkeypatch.setattr(rag, "embed_query",
+    monkeypatch.setattr(queryembed, "embed_query",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
     monkeypatch.setattr(rag, "_oneshot_pages", lambda *a, **k: ([], {}))
     monkeypatch.setattr(rag.providers, "reader_for",

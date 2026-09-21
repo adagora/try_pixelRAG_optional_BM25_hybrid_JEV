@@ -50,6 +50,7 @@ floor: no configuration can be called identical to the service below it.
 
 import argparse
 import gc
+import json
 import os
 import re
 import sys
@@ -80,7 +81,7 @@ DTYPES = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 # Comparing the constants at source level closes that hole, and reading api.py
 # as text rather than importing it keeps faiss out of this process.
 INSTRUCTION_OWNERS = [
-    "scripts/rag.py",
+    "scripts/queryembed.py",
     "scripts/encoder.py",
     "scripts/profile_search.py",
     ".venv/Lib/site-packages/pixelrag_serve/api.py",
@@ -251,18 +252,22 @@ def _cached_reference(texts: list[str], cache_path: str,
     cache = Path(cache_path)
     if use_cache and cache.exists():
         try:
-            with np.load(cache, allow_pickle=True) as z:
-                if list(z["queries"]) == texts:
+            # allow_pickle stays off. The query list is JSON in a 0-d unicode
+            # array rather than an object array, so reading this cache cannot
+            # execute anything; a cache written by the older object-array code
+            # raises ValueError here and is recomputed over, below.
+            with np.load(cache) as z:
+                if json.loads(str(z["queries"])) == texts:
                     print(f"reference: reused from {cache}")
                     return z["ref"]
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
             pass                       # unreadable cache — recompute over it
 
     print("reference:")
     ref = encode_all(texts, "cpu", "fp32")
     if use_cache:
         try:
-            np.savez(cache, ref=ref, queries=np.array(texts, dtype=object))
+            np.savez(cache, ref=ref, queries=np.array(json.dumps(texts)))
         except OSError as e:
             print(f"  (could not cache the reference: {e})")
     return ref
@@ -276,7 +281,7 @@ def main() -> int:
     ap.add_argument("--dtype", choices=sorted(DTYPES), default="fp16",
                     help="Candidate dtype; the reference is always fp32.")
     ap.add_argument("--port", type=int, default=30001)
-    ap.add_argument("--questions", default="eval/questions.yaml")
+    ap.add_argument("--questions", default="eval/questions_pl.yaml")
     # Knobs encoder_device.py also chooses, which move the embedding too.
     # Passing any of them routes both arms through profile_search.
     ap.add_argument("--attn", choices=["sdpa", "eager", "flash_attention_2"],
