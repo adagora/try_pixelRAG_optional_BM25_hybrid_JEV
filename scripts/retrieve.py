@@ -48,9 +48,30 @@ ScaleFn = Callable[[int, int, int], str]
 
 # Fraction of each additional matching chunk's score added to a page's total.
 # Low on purpose: agreement is evidence, but four half-matches must not outrank
-# one clean hit. Swept over 0.0-0.35: worth about +1 recall@4 and costs about
-# -1 top-1, both within noise on 20 questions. Kept because agreement is a
-# principled signal, not because the sweep proved it.
+# one clean hit.
+#
+# RE-SWEPT twice against the corpus that is actually indexed, and the second
+# sweep reversed the first — scripts/sweep_ranking.py. Read both, because which
+# one you would have believed is the whole lesson.
+#
+# On 13 verified questions it looked like a switch with a wide indifference
+# band: off scored 9/13 and every non-zero value scored 7-8/13, i.e. -1 top-1
+# for +1 recall, the same wash the original (now lost) sweep reported.
+#
+# On 38 it is a dial, it is monotone, and it is pointing the wrong way:
+#
+#   AGREEMENT   0.0   0.05  0.1   0.15  0.18  0.2   0.25  0.3   0.35  0.5
+#   top-1/38     28    23    22    21    21*   20    19    19    18    18
+#
+# Off is worth +7 top-1 and costs 1 recall (35/38 vs 36/38). Head to head that
+# is 9-2, p=0.065 — not resolved, but vastly stronger evidence than the wash
+# that set it. `--joint` puts the best cell at AGREEMENT=0.0 with LEX_WEIGHT
+# 2.0, scoring 36/38 against the shipped pair's 32/38.
+#
+# NOT CHANGED, deliberately. 5-1 (p=0.22) for the best of a 90-cell grid on 38
+# questions is the same shape of evidence as the 13-question conclusions this
+# repo has had to retract, and tuning on it would be repeating the mistake with
+# more decimal places. Widen eval/questions_pl.yaml and re-run before moving it.
 AGREEMENT = 0.18
 
 # Reweighting for whole-page gist vectors. MEASURED AT 1.0 — i.e. off.
@@ -66,6 +87,13 @@ AGREEMENT = 0.18
 # specific to this corpus — 875x1024 regions of an A4 catalogue page already
 # carry the page's identity (header, product family, table shape), so the gist
 # adds no information. On a corpus of dense full-bleed diagrams it might.
+#
+# On THIS index it is not merely neutral, it is inert, and that is checkable
+# rather than measurable: all 301 indexed chunks are `region` (88 in article 0,
+# 213 in article 1) and not one is a gist, so the branch this constant weights
+# never executes. Sweeping it here would draw a flat line by construction.
+# Rebuilding with scripts/chunk_multiscale.py is what would make it mean
+# anything — and only then is a sweep evidence of something.
 GIST_BONUS = 1.0
 
 # Interrogative and imperative scaffolding, stripped to leave the noun phrase.
@@ -189,7 +217,20 @@ def fuse(rankings: list[list[PageHit]]) -> list[PageHit]:
 RRF_K = 60
 
 # Weight on the lexical list. 1.0 = the two retrievers vote equally.
-# Swept on the real question set — see evaluate_pl.py --sweep.
+#
+# RE-SWEPT on this corpus (scripts/sweep_ranking.py). Same story as AGREEMENT
+# above: on 13 questions the verified column read 11/13 at every weight from
+# 0.25 to 3.0 and the value looked like it could not matter. On 38 it does.
+#
+#   LEX_WEIGHT  0.0   0.25  0.5   0.75  1.0   1.25  1.5   2.0   3.0
+#   top-1/38     21    28    29    32    32*   35    35    35    35
+#
+# 1.0 is on the shoulder, not the plateau: BM25 is under-weighted by exactly
+# the margin the narrow set could not resolve. The plateau starts at 1.25.
+#
+# NOT CHANGED for the same reason as AGREEMENT — see there. (evaluate_pl.py
+# --sweep sweeps this through the live stack; sweep_ranking.py replays cached
+# hits, which is why it can afford a 9-point grid and a 2D one.)
 LEX_WEIGHT = 1.0
 
 # How deep to read each retriever's list before fusing. Deeper than n_pages on
